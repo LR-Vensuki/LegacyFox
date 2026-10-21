@@ -1,0 +1,33 @@
+From 01ae3d4878c998920974f5bcec15bfdf0c0b0cfd Mon Sep 17 00:00:00 2001
+From: LR-Vensuki <260785366+LR-Vensuki@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 23:10:26 +0300
+Subject: [PATCH 37/42] SessionStoreUtils.initializeRestore: a settled promise
+ when the restore is already over (it crashed on null)
+
+---
+ toolkit/components/sessionstore/SessionStoreUtils.cpp | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/toolkit/components/sessionstore/SessionStoreUtils.cpp b/toolkit/components/sessionstore/SessionStoreUtils.cpp
+index 9cf479e13d..fb12df5a53 100644
+--- a/toolkit/components/sessionstore/SessionStoreUtils.cpp
++++ b/toolkit/components/sessionstore/SessionStoreUtils.cpp
+@@ -1547,7 +1547,14 @@ already_AddRefed<Promise> SessionStoreUtils::InitializeRestore(
+   MOZ_DIAGNOSTIC_ASSERT(shistory);
+   shistory->ReloadCurrentEntry();
+ 
+-  return aContext.GetRestorePromise();
++  RefPtr<Promise> promise = aContext.GetRestorePromise();
++  if (!promise) {
++    // The restore already finished (an about:blank history, say): the
++    // binding cannot return null, so a promise that is done.
++    nsCOMPtr<nsIGlobalObject> global = do_QueryInterface(aGlobal.GetAsSupports());
++    promise = Promise::CreateResolvedWithUndefined(global, aError);
++  }
++  return promise.forget();
+ }
+ 
+ /* static */
+-- 
+2.53.0
+

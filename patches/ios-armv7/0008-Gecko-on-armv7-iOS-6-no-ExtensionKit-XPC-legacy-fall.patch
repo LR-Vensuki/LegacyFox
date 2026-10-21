@@ -1,0 +1,606 @@
+From 8222eccd4756a7a6d7ff7d277611f4274363649c Mon Sep 17 00:00:00 2001
+From: LR-Vensuki <260785366+LR-Vensuki@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 01:25:53 +0300
+Subject: [PATCH 08/42] Gecko on armv7 iOS 6: no ExtensionKit/XPC, legacy
+ fallbacks for UIKit, EAGL (ES2), CoreText, CoreVideo, Keychain,
+ LocalAuthentication; NSS/aom/protobuf/buildid_reader/core-text for armv7
+ Darwin
+
+---
+ accessible/ios/MUIAccessible.h                |  2 ++
+ accessible/ios/MUIAccessible.mm               |  2 ++
+ accessible/ios/MUIRootAccessibleProtocol.h    |  2 ++
+ gfx/gl/GLContextProviderEAGL.mm               |  5 ++++
+ gfx/skia/skia/src/ports/SkFontMgr_mac_ct.cpp  |  1 +
+ gfx/skia/skia/src/ports/SkTypeface_mac_ct.cpp |  2 ++
+ gfx/skia/skia/src/utils/mac/SkCTFont.h        | 29 +++++++++++++++++++
+ gfx/thebes/gfxMacUtils.cpp                    |  2 ++
+ intl/locale/mac/OSPreferences_mac.cpp         |  2 +-
+ ipc/glue/GeckoChildProcessHost.cpp            | 16 ++++++++--
+ ipc/glue/GeckoChildProcessHost.h              |  7 +++--
+ ipc/glue/moz.build                            |  2 +-
+ security/manager/ssl/KeychainSecret.cpp       | 10 +++++--
+ .../manager/ssl/OSReauthenticatorDarwin.mm    | 12 +++++++-
+ security/manager/ssl/moz.build                |  3 +-
+ security/nss/lib/freebl/blinit.c              | 12 ++++++++
+ third_party/aom/aom_ports/aarch32_cpudetect.c | 11 ++++++-
+ .../rust/core-text/.cargo-checksum.json       |  2 +-
+ third_party/rust/core-text/src/font.rs        |  2 +-
+ .../protobuf/src/google/protobuf/port.h       |  3 ++
+ toolkit/library/buildid_reader/src/macos.rs   |  2 ++
+ toolkit/xre/IOSBootstrap.h                    |  6 +++-
+ toolkit/xre/IOSBootstrap.mm                   |  3 ++
+ widget/uikit/GeckoViewSwiftSupport.h          |  4 ++-
+ widget/uikit/ScreenHelperUIKit.mm             | 11 +++++++
+ widget/uikit/UIKitUtils.mm                    |  4 +++
+ 26 files changed, 140 insertions(+), 17 deletions(-)
+
+diff --git a/accessible/ios/MUIAccessible.h b/accessible/ios/MUIAccessible.h
+index 010e9fbf42..b6238dc4b4 100644
+--- a/accessible/ios/MUIAccessible.h
++++ b/accessible/ios/MUIAccessible.h
+@@ -64,7 +64,9 @@ inline MUIAccessible* _Nullable GetNativeFromGeckoAccessible(
+ - (nullable id)accessibilityElementAtIndex:(NSInteger)index;
+ - (NSInteger)indexOfAccessibilityElement:(nonnull id)element;
+ - (nullable NSArray*)accessibilityElements;
++#if !defined(MOZ_IOS_LEGACY)  // UIAccessibilityContainerType is iOS 11
+ - (UIAccessibilityContainerType)accessibilityContainerType;
++#endif
+ 
+ @end
+ 
+diff --git a/accessible/ios/MUIAccessible.mm b/accessible/ios/MUIAccessible.mm
+index 059ca18c2c..b190d5bc18 100644
+--- a/accessible/ios/MUIAccessible.mm
++++ b/accessible/ios/MUIAccessible.mm
+@@ -465,9 +465,11 @@ static uint64_t GetAccessibilityTraits(Accessible* aAccessible) {
+   return children;
+ }
+ 
++#if !defined(MOZ_IOS_LEGACY)
+ - (UIAccessibilityContainerType)accessibilityContainerType {
+   return UIAccessibilityContainerTypeNone;
+ }
++#endif
+ 
+ - (NSRange)_accessibilitySelectedTextRange {
+   if (!mGeckoAccessible || !mGeckoAccessible->IsHyperText()) {
+diff --git a/accessible/ios/MUIRootAccessibleProtocol.h b/accessible/ios/MUIRootAccessibleProtocol.h
+index 6d7e7a7edd..809072e551 100644
+--- a/accessible/ios/MUIRootAccessibleProtocol.h
++++ b/accessible/ios/MUIRootAccessibleProtocol.h
+@@ -48,7 +48,9 @@
+ 
+ - (nullable NSArray*)accessibilityElements;
+ 
++#if !defined(MOZ_IOS_LEGACY)  // UIAccessibilityContainerType is iOS 11
+ - (UIAccessibilityContainerType)accessibilityContainerType;
++#endif
+ 
+ @end
+ 
+diff --git a/gfx/gl/GLContextProviderEAGL.mm b/gfx/gl/GLContextProviderEAGL.mm
+index 8539821513..bbc00d73b7 100644
+--- a/gfx/gl/GLContextProviderEAGL.mm
++++ b/gfx/gl/GLContextProviderEAGL.mm
+@@ -91,8 +91,13 @@ static GLContextEAGL* GetGlobalContextEAGL() {
+ 
+ static RefPtr<GLContext> CreateEAGLContext(const GLContextDesc& desc,
+                                            GLContextEAGL* sharedContext) {
++#if defined(MOZ_IOS_LEGACY)
++  // A4-A6 (PowerVR SGX) are OpenGL ES 2.0 only.
++  EAGLRenderingAPI apis[] = {kEAGLRenderingAPIOpenGLES2};
++#else
+   EAGLRenderingAPI apis[] = {kEAGLRenderingAPIOpenGLES3,
+                              kEAGLRenderingAPIOpenGLES2};
++#endif
+ 
+   // Try to create a GLES3 context if we can, otherwise fall back to GLES2
+   EAGLContext* context = nullptr;
+diff --git a/gfx/skia/skia/src/ports/SkFontMgr_mac_ct.cpp b/gfx/skia/skia/src/ports/SkFontMgr_mac_ct.cpp
+index f956fbd45d..39aca6befa 100644
+--- a/gfx/skia/skia/src/ports/SkFontMgr_mac_ct.cpp
++++ b/gfx/skia/skia/src/ports/SkFontMgr_mac_ct.cpp
+@@ -33,6 +33,7 @@
+ #include "src/base/SkUTF.h"
+ #include "src/ports/SkTypeface_mac_ct.h"
+ #include "src/utils/mac/SkUniqueCFRef.h"
++#include "src/utils/mac/SkCTFont.h"
+ 
+ #include <string.h>
+ #include <memory>
+diff --git a/gfx/skia/skia/src/ports/SkTypeface_mac_ct.cpp b/gfx/skia/skia/src/ports/SkTypeface_mac_ct.cpp
+index 21d6e9cfd5..c3a5706afa 100644
+--- a/gfx/skia/skia/src/ports/SkTypeface_mac_ct.cpp
++++ b/gfx/skia/skia/src/ports/SkTypeface_mac_ct.cpp
+@@ -723,6 +723,7 @@ bool SkTypeface_Mac::onGlyphMaskNeedsCurrentColor() const {
+ 
+ CFArrayRef SkTypeface_Mac::getVariationAxes() const {
+     fInitVariationAxes([this]{
++#if !defined(MOZ_IOS_LEGACY)  // kCTFontVariationAxesAttribute is iOS 13
+         // Prefer kCTFontVariationAxesAttribute, faster since it doesn't localize axis names.
+         SkUniqueCFRef<CTFontDescriptorRef> desc(CTFontCopyFontDescriptor(fFontRef.get()));
+         SkUniqueCFRef<CFTypeRef> cf(
+@@ -733,6 +734,7 @@ CFArrayRef SkTypeface_Mac::getVariationAxes() const {
+             cf.release();
+             return;
+         }
++#endif
+         fVariationAxes.reset(CTFontCopyVariationAxes(fFontRef.get()));
+     });
+     return fVariationAxes.get();
+diff --git a/gfx/skia/skia/src/utils/mac/SkCTFont.h b/gfx/skia/skia/src/utils/mac/SkCTFont.h
+index ef18938b2b..a4c5609fe8 100644
+--- a/gfx/skia/skia/src/utils/mac/SkCTFont.h
++++ b/gfx/skia/skia/src/utils/mac/SkCTFont.h
+@@ -19,6 +19,35 @@
+ #include <CoreGraphics/CoreGraphics.h>
+ #endif
+ 
++#if defined(SK_BUILD_FOR_IOS) && defined(MOZ_IOS_LEGACY)
++// LegacyFox, iOS 4-7: CoreText calls from iOS 13 done with what iOS 4 has.
++#include <CoreText/CoreText.h>
++static inline CTFontDescriptorRef SkLegacyCreateFontDescriptorFromData(CFDataRef data) {
++    CGDataProviderRef provider = CGDataProviderCreateWithCFData(data);
++    if (!provider) {
++        return nullptr;
++    }
++    CGFontRef cgFont = CGFontCreateWithDataProvider(provider);
++    CGDataProviderRelease(provider);
++    if (!cgFont) {
++        return nullptr;
++    }
++    // A descriptor only finds the font again by name once it is registered.
++    CTFontManagerRegisterGraphicsFont(cgFont, nullptr);
++    CTFontRef font = CTFontCreateWithGraphicsFont(cgFont, 0, nullptr, nullptr);
++    CGFontRelease(cgFont);
++    if (!font) {
++        return nullptr;
++    }
++    CTFontDescriptorRef desc = CTFontCopyFontDescriptor(font);
++    CFRelease(font);
++    return desc;
++}
++#define CTFontManagerCreateFontDescriptorFromData SkLegacyCreateFontDescriptorFromData
++#define CTFontCreateForStringWithLanguage(font, string, range, language) \
++    CTFontCreateForString(font, string, range)
++#endif
++
+ enum class SkCTFontSmoothBehavior {
+     none, // SmoothFonts produces no effect.
+     some, // SmoothFonts produces some effect, but not subpixel coverage.
+diff --git a/gfx/thebes/gfxMacUtils.cpp b/gfx/thebes/gfxMacUtils.cpp
+index 653974853f..6d81f9cf10 100644
+--- a/gfx/thebes/gfxMacUtils.cpp
++++ b/gfx/thebes/gfxMacUtils.cpp
+@@ -11,6 +11,7 @@
+     case mozilla::gfx::TransferFunction::BT709:
+       return kCVImageBufferTransferFunction_ITU_R_709_2;
+ 
++#if !defined(MOZ_IOS_LEGACY)  // these keys are iOS 10-11
+     case mozilla::gfx::TransferFunction::SRGB:
+       return kCVImageBufferTransferFunction_sRGB;
+ 
+@@ -19,6 +20,7 @@
+ 
+     case mozilla::gfx::TransferFunction::HLG:
+       return kCVImageBufferTransferFunction_ITU_R_2100_HLG;
++#endif
+ 
+     default:
+       MOZ_ASSERT_UNREACHABLE("Unknown TransferFunction.");
+diff --git a/intl/locale/mac/OSPreferences_mac.cpp b/intl/locale/mac/OSPreferences_mac.cpp
+index 7524615979..3ed387273e 100644
+--- a/intl/locale/mac/OSPreferences_mac.cpp
++++ b/intl/locale/mac/OSPreferences_mac.cpp
+@@ -154,5 +154,5 @@ bool OSPreferences::ReadDateTimePattern(DateTimeFormatStyle aDateStyle,
+ void OSPreferences::RemoveObservers() {
+   ::CFNotificationCenterRemoveObserver(
+       ::CFNotificationCenterGetLocalCenter(), this,
+-      kCTFontManagerRegisteredFontsChangedNotification, 0);
++      kCFLocaleCurrentLocaleDidChangeNotification, 0);
+ }
+diff --git a/ipc/glue/GeckoChildProcessHost.cpp b/ipc/glue/GeckoChildProcessHost.cpp
+index 4ce81491b7..faebfa6318 100644
+--- a/ipc/glue/GeckoChildProcessHost.cpp
++++ b/ipc/glue/GeckoChildProcessHost.cpp
+@@ -132,7 +132,7 @@ struct LaunchResults {
+ #ifdef XP_MACOSX
+   task_t mChildTask = MACH_PORT_NULL;
+ #endif
+-#ifdef XP_IOS
++#ifdef MOZ_IOS_EXTENSIONKIT
+   Maybe<ExtensionKitProcess> mExtensionKitProcess;
+   DarwinObjectPtr<xpc_connection_t> mXPCConnection;
+   UniqueBEProcessCapabilityGrant mForegroundCapabilityGrant;
+@@ -351,7 +351,9 @@ class IosProcessLauncher : public PosixProcessLauncher {
+   virtual Result<Ok, LaunchError> DoSetup() override;
+   virtual RefPtr<ProcessLaunchPromise> DoLaunch() override;
+ 
++#  if defined(MOZ_IOS_EXTENSIONKIT)
+   DarwinObjectPtr<xpc_object_t> mBootstrapMessage;
++#  endif
+ };
+ typedef IosProcessLauncher ProcessLauncher;
+ #  else
+@@ -428,7 +430,7 @@ GeckoChildProcessHost::~GeckoChildProcessHost() {
+       mach_port_deallocate(mach_task_self(), mChildTask);
+     }
+ #endif
+-#if defined(XP_IOS)
++#if defined(MOZ_IOS_EXTENSIONKIT)
+     if (mForegroundCapabilityGrant) {
+       mForegroundCapabilityGrant.reset();
+     }
+@@ -784,7 +786,7 @@ bool GeckoChildProcessHost::AsyncLaunch(
+ #ifdef XP_MACOSX
+                     this->mChildTask = aResults.mChildTask;
+ #endif
+-#ifdef XP_IOS
++#ifdef MOZ_IOS_EXTENSIONKIT
+                     this->mExtensionKitProcess = aResults.mExtensionKitProcess;
+                     this->mXPCConnection = aResults.mXPCConnection;
+                     this->mForegroundCapabilityGrant =
+@@ -1393,6 +1395,13 @@ Result<Ok, LaunchError> IosProcessLauncher::DoSetup() {
+   return Ok();
+ }
+ 
++#  if defined(MOZ_IOS_LEGACY)
++RefPtr<ProcessLaunchPromise> IosProcessLauncher::DoLaunch() {
++  // LegacyFox runs Gecko in a single process; nothing may ask for another.
++  return ProcessLaunchPromise::CreateAndReject(
++      LaunchError("no child processes on iOS 4-7"), __func__);
++}
++#  else
+ RefPtr<ProcessLaunchPromise> IosProcessLauncher::DoLaunch() {
+   ExtensionKitProcess::Kind kind = ExtensionKitProcess::Kind::WebContent;
+   if (mProcessType == GeckoProcessType_GPU) {
+@@ -1527,6 +1536,7 @@ RefPtr<ProcessLaunchPromise> IosProcessLauncher::DoLaunch() {
+ 
+   return promise;
+ }
++#  endif  // MOZ_IOS_LEGACY
+ #endif
+ 
+ #ifdef XP_MACOSX
+diff --git a/ipc/glue/GeckoChildProcessHost.h b/ipc/glue/GeckoChildProcessHost.h
+index 41d972963e..0bc8512198 100644
+--- a/ipc/glue/GeckoChildProcessHost.h
++++ b/ipc/glue/GeckoChildProcessHost.h
+@@ -32,7 +32,10 @@
+ #include "nsXULAppAPI.h"  // for GeckoProcessType
+ #include "nsString.h"
+ 
+-#if defined(XP_IOS)
++// ExtensionKit child processes are iOS 17; LegacyFox (MOZ_IOS_LEGACY) runs
++// Gecko in one process and never launches any.
++#if defined(XP_IOS) && !defined(MOZ_IOS_LEGACY)
++#  define MOZ_IOS_EXTENSIONKIT 1
+ #  include "mozilla/ipc/ExtensionKitUtils.h"
+ #endif
+ 
+@@ -267,7 +270,7 @@ class GeckoChildProcessHost : public SupportsWeakPtr,
+ #if defined(XP_MACOSX)
+   task_t mChildTask MOZ_GUARDED_BY(mHandleLock);
+ #endif
+-#if defined(MOZ_WIDGET_UIKIT)
++#if defined(MOZ_IOS_EXTENSIONKIT)
+   Maybe<ExtensionKitProcess> mExtensionKitProcess MOZ_GUARDED_BY(mHandleLock);
+   DarwinObjectPtr<xpc_connection_t> mXPCConnection MOZ_GUARDED_BY(mHandleLock);
+   UniqueBEProcessCapabilityGrant mForegroundCapabilityGrant
+diff --git a/ipc/glue/moz.build b/ipc/glue/moz.build
+index 9c24b5b79c..3c89373fb4 100644
+--- a/ipc/glue/moz.build
++++ b/ipc/glue/moz.build
+@@ -147,7 +147,7 @@ if CONFIG["OS_ARCH"] != "WINNT":
+         "FileDescriptorShuffle.cpp",
+     ]
+ 
+-if CONFIG["TARGET_OS"] == "iOS":
++if CONFIG["TARGET_OS"] == "iOS" and not CONFIG["MOZ_IOS_LEGACY"]:
+     EXPORTS.mozilla.ipc += [
+         "ExtensionKitUtils.h",
+     ]
+diff --git a/security/manager/ssl/KeychainSecret.cpp b/security/manager/ssl/KeychainSecret.cpp
+index b93ff9d1ae..ac2355de17 100644
+--- a/security/manager/ssl/KeychainSecret.cpp
++++ b/security/manager/ssl/KeychainSecret.cpp
+@@ -5,6 +5,7 @@
+ 
+ #include "KeychainSecret.h"
+ 
++#include <CoreFoundation/CoreFoundation.h>
+ #include <Security/Security.h>
+ 
+ #include "mozilla/Logging.h"
+@@ -54,7 +55,8 @@ nsresult KeychainSecret::StoreSecret(const nsACString& aSecret,
+             ("DeleteSecret before StoreSecret failed"));
+     return rv;
+   }
+-  const CFStringRef keys[] = {kSecClass, kSecAttrAccount, kSecValueData};
++  // The iOS 6 SDK declares the kSec* keys as CFTypeRef.
++  const void* keys[] = {kSecClass, kSecAttrAccount, kSecValueData};
+   ScopedCFType<CFStringRef> label(MozillaStringToCFString(aLabel));
+   if (!label) {
+     MOZ_LOG(gKeychainSecretLog, LogLevel::Debug,
+@@ -94,7 +96,8 @@ nsresult KeychainSecret::DeleteSecret(const nsACString& aLabel) {
+   // { class: generic password,
+   //   account: the given label }
+   // and then call SecItemDelete.
+-  const CFStringRef keys[] = {kSecClass, kSecAttrAccount};
++  // The iOS 6 SDK declares the kSec* keys as CFTypeRef.
++  const void* keys[] = {kSecClass, kSecAttrAccount};
+   ScopedCFType<CFStringRef> label(MozillaStringToCFString(aLabel));
+   if (!label) {
+     MOZ_LOG(gKeychainSecretLog, LogLevel::Debug,
+@@ -133,7 +136,8 @@ nsresult KeychainSecret::RetrieveSecret(const nsACString& aLabel,
+   // This searches for and returns the attributes and data for the secret
+   // matching the given label. We then extract the data (i.e. the secret) and
+   // return it.
+-  const CFStringRef keys[] = {kSecClass, kSecAttrAccount, kSecMatchLimit,
++  // The iOS 6 SDK declares the kSec* keys as CFTypeRef.
++  const void* keys[] = {kSecClass, kSecAttrAccount, kSecMatchLimit,
+                               kSecReturnAttributes, kSecReturnData};
+   ScopedCFType<CFStringRef> label(MozillaStringToCFString(aLabel));
+   if (!label) {
+diff --git a/security/manager/ssl/OSReauthenticatorDarwin.mm b/security/manager/ssl/OSReauthenticatorDarwin.mm
+index e8f282e76d..96f095b6c6 100644
+--- a/security/manager/ssl/OSReauthenticatorDarwin.mm
++++ b/security/manager/ssl/OSReauthenticatorDarwin.mm
+@@ -9,13 +9,22 @@
+ using namespace mozilla;
+ 
+ #include <CoreFoundation/CoreFoundation.h>
+-#include <LocalAuthentication/LocalAuthentication.h>
++#if !defined(MOZ_IOS_LEGACY)
++#  include <LocalAuthentication/LocalAuthentication.h>
++#endif
+ 
+ static const int32_t kPasswordNotSetErrorCode = -1000;
+ 
+ nsresult ReauthenticateUserMacOS(const nsAString& aPrompt,
+                                  /* out */ bool& aReauthenticated,
+                                  /* out */ bool& aIsBlankPassword) {
++#if defined(MOZ_IOS_LEGACY)
++  // LocalAuthentication came with iOS 8. Like an account without a passcode:
++  // the passwords screen in LegacyFox's own UI does the asking.
++  aReauthenticated = true;
++  aIsBlankPassword = true;
++  return NS_OK;
++#else
+   // The idea here is that we ask to be authorized to unlock the user's session.
+   // This should cause a prompt to come up for the user asking them for their
+   // password. If they correctly enter it, we'll set aReauthenticated to true.
+@@ -58,4 +67,5 @@ nsresult ReauthenticateUserMacOS(const nsAString& aPrompt,
+ 
+   [context release];
+   return NS_OK;
++#endif
+ }
+diff --git a/security/manager/ssl/moz.build b/security/manager/ssl/moz.build
+index b1ae87b419..ed073984bf 100644
+--- a/security/manager/ssl/moz.build
++++ b/security/manager/ssl/moz.build
+@@ -190,9 +190,10 @@ if CONFIG["TARGET_KERNEL"] == "Darwin":
+     ]
+     OS_LIBS += [
+         "-framework CoreFoundation",
+-        "-framework LocalAuthentication",
+         "-framework Security",
+     ]
++    if not CONFIG["MOZ_IOS_LEGACY"]:
++        OS_LIBS += ["-framework LocalAuthentication"]
+ 
+ IPDL_SOURCES += [
+     "PIPCClientCerts.ipdl",
+diff --git a/security/nss/lib/freebl/blinit.c b/security/nss/lib/freebl/blinit.c
+index 50e7a21e2b..be68a32bed 100644
+--- a/security/nss/lib/freebl/blinit.c
++++ b/security/nss/lib/freebl/blinit.c
+@@ -160,6 +160,18 @@ extern unsigned long getauxval(unsigned long type) __attribute__((weak));
+ static unsigned long (*getauxval)(unsigned long) = NULL;
+ #endif /* defined(__GNUC__) && __GNUC__ >= 2 && defined(__ELF__)*/
+ 
++#if defined(__arm__) && defined(TARGET_OS_IPHONE)
++/* armv7 iOS (LegacyFox): no auxv. NEON is always there, the ARMv8 crypto
++ * extensions never are. */
++static unsigned long (*getauxval)(unsigned long) = NULL;
++#ifndef AT_HWCAP
++#define AT_HWCAP 16
++#endif
++#ifndef AT_HWCAP2
++#define AT_HWCAP2 26
++#endif
++#endif
++
+ #if (defined(__FreeBSD__) || defined(__OpenBSD__)) && __has_include(<sys/auxv.h>)
+ /* Avoid conflict with static declaration above */
+ #define getauxval freebl_getauxval
+diff --git a/third_party/aom/aom_ports/aarch32_cpudetect.c b/third_party/aom/aom_ports/aarch32_cpudetect.c
+index af6774c5d2..2cc52cf43e 100644
+--- a/third_party/aom/aom_ports/aarch32_cpudetect.c
++++ b/third_party/aom/aom_ports/aarch32_cpudetect.c
+@@ -71,7 +71,16 @@ static int arm_get_cpu_caps(void) {
+ #endif  // HAVE_NEON
+   return flags;
+ }
+-#else   // end __linux__
++#elif defined(__APPLE__)  // end __linux__
++// LegacyFox: every armv7 Apple CPU (A4 and later) has NEON.
++static int arm_get_cpu_caps(void) {
++  int flags = 0;
++#if HAVE_NEON
++  flags |= HAS_NEON;
++#endif  // HAVE_NEON
++  return flags;
++}
++#else   // end __APPLE__
+ #error \
+     "Runtime CPU detection selected, but no CPU detection method " \
+ "available for your platform. Rerun cmake with -DCONFIG_RUNTIME_CPU_DETECT=0."
+diff --git a/third_party/rust/core-text/.cargo-checksum.json b/third_party/rust/core-text/.cargo-checksum.json
+index cf2e84c908..af8f2a4b6c 100644
+--- a/third_party/rust/core-text/.cargo-checksum.json
++++ b/third_party/rust/core-text/.cargo-checksum.json
+@@ -1 +1 @@
+-{"files":{".cargo_vcs_info.json":"fdfdd58dd838cb0aea194396eea15f42f9b388f4e5ca72f7b95eac957243b1a5",".travis.yml":"54c987a206c83f695247bf470d525a37f54de960d4b18eeb899d751edbf61208","COPYRIGHT":"ec82b96487e9e778ee610c7ab245162464782cfa1f555c2299333f8dbe5c036a","Cargo.toml":"4d4220f78f2823ddc045b0664ac88627bbe3d3bd3dac79539b96c193aa5bfbbc","Cargo.toml.orig":"766a7a2ade6be7b395c0a809d7dd82356bbbfc182b241ccb66f3c6d3ee9f6345","LICENSE-APACHE":"a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2","LICENSE-MIT":"62065228e42caebca7e7d7db1204cbb867033de5982ca4009928915e4095f3a3","README.md":"98d25015857a430aac32f34bdc979a1a66e672a0ea42c5f92dd9cfe23c1fccfd","src/font.rs":"67acc8a7a9329e7b59d7addccf8d32cb705587573ac4d736df10714b590a7d82","src/font_collection.rs":"2bd992032aa1dda4042c8e28974a5708a7ddcd60f3fbd1d58499c1e7b54ae615","src/font_descriptor.rs":"df229425f3f425af441cb51c4fcd4b8eb7f758bbe34bd2437f0bf56dff7d42c9","src/font_manager.rs":"f936404cfa76fb4e467b3233e328a50a2068ae2370407245b62528cb4b948bb1","src/frame.rs":"1fb9434eab2460abc5d882e8ff228a6376b2557fc6c2483a41e0a3495724ca02","src/framesetter.rs":"13e34b4111cee5f023aa05e2220d2a6f102e96fd18c51a356992bffd6c9fc7c1","src/lib.rs":"eeb19facf14bb50870c2481bc370d7e008d5755e7d5cbc10de7891ceab28db2e","src/line.rs":"592a5eb6b5d14f3e4cceb449ee935a4385ce364988f23c483a8c36dd02be4e34","src/run.rs":"fd3838ea31da8fd71a33b256aa397192d96094b457489dc6c91ac190130727c8","src/string_attributes.rs":"398ccc9fcf6238bc9a88f33bb52237a458f0d7149b9688cfee8957775768a6ff"},"package":"c9d2790b5c08465d49f8dc05c8bcae9fea467855947db39b0f8145c091aaced5"}
+\ No newline at end of file
++{"files":{".cargo_vcs_info.json":"fdfdd58dd838cb0aea194396eea15f42f9b388f4e5ca72f7b95eac957243b1a5",".travis.yml":"54c987a206c83f695247bf470d525a37f54de960d4b18eeb899d751edbf61208","COPYRIGHT":"ec82b96487e9e778ee610c7ab245162464782cfa1f555c2299333f8dbe5c036a","Cargo.toml":"4d4220f78f2823ddc045b0664ac88627bbe3d3bd3dac79539b96c193aa5bfbbc","Cargo.toml.orig":"766a7a2ade6be7b395c0a809d7dd82356bbbfc182b241ccb66f3c6d3ee9f6345","LICENSE-APACHE":"a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2","LICENSE-MIT":"62065228e42caebca7e7d7db1204cbb867033de5982ca4009928915e4095f3a3","README.md":"98d25015857a430aac32f34bdc979a1a66e672a0ea42c5f92dd9cfe23c1fccfd","src/font_collection.rs":"2bd992032aa1dda4042c8e28974a5708a7ddcd60f3fbd1d58499c1e7b54ae615","src/font_descriptor.rs":"df229425f3f425af441cb51c4fcd4b8eb7f758bbe34bd2437f0bf56dff7d42c9","src/font_manager.rs":"f936404cfa76fb4e467b3233e328a50a2068ae2370407245b62528cb4b948bb1","src/frame.rs":"1fb9434eab2460abc5d882e8ff228a6376b2557fc6c2483a41e0a3495724ca02","src/framesetter.rs":"13e34b4111cee5f023aa05e2220d2a6f102e96fd18c51a356992bffd6c9fc7c1","src/lib.rs":"eeb19facf14bb50870c2481bc370d7e008d5755e7d5cbc10de7891ceab28db2e","src/line.rs":"592a5eb6b5d14f3e4cceb449ee935a4385ce364988f23c483a8c36dd02be4e34","src/run.rs":"fd3838ea31da8fd71a33b256aa397192d96094b457489dc6c91ac190130727c8","src/string_attributes.rs":"398ccc9fcf6238bc9a88f33bb52237a458f0d7149b9688cfee8957775768a6ff"},"package":"c9d2790b5c08465d49f8dc05c8bcae9fea467855947db39b0f8145c091aaced5"}
+\ No newline at end of file
+diff --git a/third_party/rust/core-text/src/font.rs b/third_party/rust/core-text/src/font.rs
+index 0d303a63fe..ea16370c4f 100644
+--- a/third_party/rust/core-text/src/font.rs
++++ b/third_party/rust/core-text/src/font.rs
+@@ -243,7 +243,7 @@ pub fn new_ui_font_for_language(
+     unsafe {
+         let font_ref = CTFontCreateUIFontForLanguage(
+             ui_type,
+-            size,
++            size as CGFloat,
+             language
+                 .as_ref()
+                 .map(|x| x.as_concrete_TypeRef())
+diff --git a/toolkit/components/protobuf/src/google/protobuf/port.h b/toolkit/components/protobuf/src/google/protobuf/port.h
+index 9cab85951f..6c993537ff 100644
+--- a/toolkit/components/protobuf/src/google/protobuf/port.h
++++ b/toolkit/components/protobuf/src/google/protobuf/port.h
+@@ -262,6 +262,9 @@ struct is_supported_message_type
+ // To prevent sharing cache lines between threads
+ #ifdef __cpp_aligned_new
+ enum { kCacheAlignment = 64 };
++#elif defined(__APPLE__) && defined(__arm__)
++// armv7 Darwin: max_align_t is 4, less than std::atomic<uint64_t> needs.
++enum { kCacheAlignment = 8 };
+ #else
+ enum { kCacheAlignment = alignof(max_align_t) };  // do the best we can
+ #endif
+diff --git a/toolkit/library/buildid_reader/src/macos.rs b/toolkit/library/buildid_reader/src/macos.rs
+index 78ec6e5422..f1b4b48a77 100644
+--- a/toolkit/library/buildid_reader/src/macos.rs
++++ b/toolkit/library/buildid_reader/src/macos.rs
+@@ -58,6 +58,8 @@ impl BuildIdReader {
+                     let that_arch = mach::constants::cputype::CPU_TYPE_X86_64;
+                     #[cfg(target_arch = "aarch64")]
+                     let that_arch = mach::constants::cputype::CPU_TYPE_ARM64;
++                    #[cfg(target_arch = "arm")]
++                    let that_arch = mach::constants::cputype::CPU_TYPE_ARM;
+ 
+                     let arch_index = arches
+                         .iter()
+diff --git a/toolkit/xre/IOSBootstrap.h b/toolkit/xre/IOSBootstrap.h
+index 2fffb86bd6..0fa7db1a2c 100644
+--- a/toolkit/xre/IOSBootstrap.h
++++ b/toolkit/xre/IOSBootstrap.h
+@@ -14,7 +14,9 @@
+ #  define MOZ_BEGIN_EXTERN_C
+ #  define MOZ_END_EXTERN_C
+ #endif
+-#include <xpc/xpc.h>
++#if !defined(MOZ_IOS_LEGACY)
++#  include <xpc/xpc.h>
++#endif
+ 
+ @protocol SwiftGeckoViewRuntime;
+ @protocol GeckoProcessExtension;
+@@ -24,9 +26,11 @@ MOZ_BEGIN_EXTERN_C
+ MOZ_EXPORT int MainProcessInit(int aArgc, char** aArgv,
+                                id<SwiftGeckoViewRuntime> aRuntime);
+ 
++#if !defined(MOZ_IOS_LEGACY)
+ MOZ_EXPORT void ChildProcessInit(xpc_connection_t aXpcConnection,
+                                  id<GeckoProcessExtension> aProcess,
+                                  id<SwiftGeckoViewRuntime> aRuntime);
++#endif
+ 
+ MOZ_END_EXTERN_C
+ 
+diff --git a/toolkit/xre/IOSBootstrap.mm b/toolkit/xre/IOSBootstrap.mm
+index 264320aed7..be4e1518b3 100644
+--- a/toolkit/xre/IOSBootstrap.mm
++++ b/toolkit/xre/IOSBootstrap.mm
+@@ -44,6 +44,8 @@ int MainProcessInit(int aArgc, char** aArgv,
+   return bootstrap.inspect()->XRE_main(aArgc, aArgv, config);
+ }
+ 
++// LegacyFox (MOZ_IOS_LEGACY) runs no child processes, so no XPC bootstrap.
++#if !defined(MOZ_IOS_LEGACY)
+ static void HandleBootstrapMessage(xpc_object_t aEvent);
+ 
+ void ChildProcessInit(xpc_connection_t aXpcConnection,
+@@ -201,3 +203,4 @@ void HandleBootstrapMessage(xpc_object_t aEvent) {
+   dispatch_async(dispatch_get_main_queue(),
+                  [argc, argv] { _exit(ChildProcessInitImpl(argc, argv)); });
+ }
++#endif  // !MOZ_IOS_LEGACY
+diff --git a/widget/uikit/GeckoViewSwiftSupport.h b/widget/uikit/GeckoViewSwiftSupport.h
+index e68fca9134..69eea0a1ec 100644
+--- a/widget/uikit/GeckoViewSwiftSupport.h
++++ b/widget/uikit/GeckoViewSwiftSupport.h
+@@ -19,7 +19,9 @@
+ 
+ #import <Foundation/Foundation.h>
+ #import <UIKit/UIKit.h>
+-#import <xpc/xpc.h>
++#if !defined(MOZ_IOS_LEGACY)
++#  import <xpc/xpc.h>
++#endif
+ 
+ @protocol SwiftEventDispatcher;
+ 
+diff --git a/widget/uikit/ScreenHelperUIKit.mm b/widget/uikit/ScreenHelperUIKit.mm
+index b800da5aaa..058f72a6f4 100644
+--- a/widget/uikit/ScreenHelperUIKit.mm
++++ b/widget/uikit/ScreenHelperUIKit.mm
+@@ -31,7 +31,12 @@ static already_AddRefed<Screen> MakeScreen(UIScreen* aScreen) {
+ 
+   DesktopToLayoutDeviceScale contentsScaleFactor([aScreen scale]);
+   CSSToLayoutDeviceScale defaultCssScaleFactor(contentsScaleFactor.scale);
++#if defined(MOZ_IOS_LEGACY)
++  // fixedCoordinateSpace is iOS 8; before it, bounds are always portrait.
++  CGRect bounds = [aScreen bounds];
++#else
+   CGRect bounds = [[aScreen fixedCoordinateSpace] bounds];
++#endif
+   LayoutDeviceIntRect rect;
+   rect.x = NSToIntRound(bounds.origin.x * contentsScaleFactor.scale);
+   rect.y = NSToIntRound(bounds.origin.y * contentsScaleFactor.scale);
+@@ -53,14 +58,20 @@ static already_AddRefed<Screen> MakeScreen(UIScreen* aScreen) {
+            pixelDepth, contentsScaleFactor.scale, defaultCssScaleFactor.scale,
+            dpi));
+ 
++#if defined(MOZ_IOS_LEGACY)
++  NSInteger fps = 60;  // maximumFramesPerSecond is iOS 10.3
++#else
+   NSInteger fps = [aScreen maximumFramesPerSecond];
++#endif
+   // UIKit doesn't give us real luminance values in cd/m^2, so we use relative
+   // values and pretend the SDR content brightness is 100 which is mentioned in
+   // Apple docs as typical.
+   float displayHDRHeadroom = 1.0f;
++#if !defined(MOZ_IOS_LEGACY)
+   if (@available(iOS 16.0, *)) {
+     displayHDRHeadroom = [aScreen potentialEDRHeadroom];
+   }
++#endif
+   float sdrContentBrightness = 100.0f;
+   float hdrPeakBrightness = displayHDRHeadroom * sdrContentBrightness;
+   bool isHDR = displayHDRHeadroom > 1.0f;
+diff --git a/widget/uikit/UIKitUtils.mm b/widget/uikit/UIKitUtils.mm
+index 3c259b196f..11cb630ed7 100644
+--- a/widget/uikit/UIKitUtils.mm
++++ b/widget/uikit/UIKitUtils.mm
+@@ -18,7 +18,11 @@ UIKeyboardType UIKitUtils::GetUIKeyboardType(const InputContext& aContext) {
+     return UIKeyboardTypeNumberPad;
+   }
+   if (aContext.mHTMLInputMode.EqualsLiteral("search")) {
++#if defined(MOZ_IOS_LEGACY)
++    return UIKeyboardTypeDefault;  // UIKeyboardTypeWebSearch is iOS 7
++#else
+     return UIKeyboardTypeWebSearch;
++#endif
+   }
+   if (aContext.mHTMLInputMode.EqualsLiteral("tel")) {
+     return UIKeyboardTypePhonePad;
+-- 
+2.53.0
+

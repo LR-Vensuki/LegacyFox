@@ -1,0 +1,143 @@
+From 6f63aad6cca749fd002f9dd19be6f630e72529be Mon Sep 17 00:00:00 2001
+From: LR-Vensuki <260785366+LR-Vensuki@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 23:07:03 +0300
+Subject: [PATCH 14/42] armv7 iOS 6: Rust without LTO and with 16 codegen units
+ (Mach-O ARM relocation range), VT decoder keys by value, no VT encoder
+
+---
+ config/makefiles/rust.mk                     | 10 ++++++++++
+ dom/media/platforms/PEMFactory.cpp           | 12 ++++++------
+ dom/media/platforms/apple/AppleVTDecoder.cpp |  4 ++++
+ dom/media/platforms/moz.build                |  8 ++++++--
+ 4 files changed, 26 insertions(+), 8 deletions(-)
+
+diff --git a/config/makefiles/rust.mk b/config/makefiles/rust.mk
+index 915da86d85..80d5583d00 100644
+--- a/config/makefiles/rust.mk
++++ b/config/makefiles/rust.mk
+@@ -118,8 +118,12 @@ ifndef rustflags_sancov
+ # Never enable when coverage is enabled to work around https://github.com/rust-lang/rust/issues/90045.
+ ifndef MOZ_CODE_COVERAGE
+ ifeq (,$(findstring gkrust_gtest,$(RUST_LIBRARY_FILE)))
++# LegacyFox: on armv7 Mach-O no object may pass 16 MiB (scattered
++# relocations carry 24-bit offsets), and LTO makes gkrust one object.
++ifneq (armv7-apple-ios-legacy,$(RUST_TARGET))
+ cargo_rustc_flags += -Clto$(if $(filter full,$(MOZ_LTO_RUST_CROSS)),=fat)
+ endif
++endif
+ # We need -Cembed-bitcode=yes for all crates when using -Clto.
+ RUSTFLAGS += -Cembed-bitcode=yes
+ endif
+@@ -376,8 +380,14 @@ $(HOST_RECIPES): RUSTFLAGS:=$(rustflags_override)
+ # crate. This results in better optimization and less code duplication at the
+ # cost of longer compile times.
+ ifndef DEVELOPER_OPTIONS
++ifeq (armv7-apple-ios-legacy,$(RUST_TARGET))
++# See the LTO note above: several codegen units keep every object small.
++$(TARGET_RECIPES): RUSTFLAGS += -C codegen-units=16
++$(HOST_RECIPES): RUSTFLAGS += -C codegen-units=1
++else
+ $(TARGET_RECIPES) $(HOST_RECIPES): RUSTFLAGS += -C codegen-units=1
+ endif
++endif
+ 
+ # We use the + prefix to pass down the jobserver fds to cargo, but we
+ # don't use the prefix when make -n is used, so that cargo doesn't run
+diff --git a/dom/media/platforms/PEMFactory.cpp b/dom/media/platforms/PEMFactory.cpp
+index 31fd2f76a7..f0d9520814 100644
+--- a/dom/media/platforms/PEMFactory.cpp
++++ b/dom/media/platforms/PEMFactory.cpp
+@@ -6,7 +6,7 @@
+ 
+ #include "PlatformEncoderModule.h"
+ 
+-#ifdef MOZ_APPLEMEDIA
++#if defined(MOZ_APPLEMEDIA) && !defined(MOZ_IOS_LEGACY)  // no VT encoder on iOS 4-7
+ #  include "AppleEncoderModule.h"
+ #endif
+ 
+@@ -78,7 +78,7 @@ void PEMFactory::InitGpuPEMs() {
+     return;
+   }
+ 
+-#ifdef MOZ_APPLEMEDIA
++#if defined(MOZ_APPLEMEDIA) && !defined(MOZ_IOS_LEGACY)  // no VT encoder on iOS 4-7
+   if (StaticPrefs::media_gpu_process_encoder()) {
+     RefPtr<PlatformEncoderModule> m(new AppleEncoderModule());
+     mCurrentPEMs.AppendElement(m);
+@@ -114,7 +114,7 @@ void PEMFactory::InitGpuPEMs() {
+ }
+ 
+ void PEMFactory::InitRddPEMs() {
+-#ifdef MOZ_APPLEMEDIA
++#if defined(MOZ_APPLEMEDIA) && !defined(MOZ_IOS_LEGACY)  // no VT encoder on iOS 4-7
+   if (StaticPrefs::media_use_remote_encoder_video() &&
+       StaticPrefs::media_rdd_applemedia_enabled()) {
+     RefPtr<PlatformEncoderModule> m(new AppleEncoderModule());
+@@ -211,7 +211,7 @@ void PEMFactory::InitContentPEMs() {
+ 
+   if (StaticPrefs::media_use_remote_encoder_audio() &&
+       StaticPrefs::media_utility_process_enabled()) {
+-#ifdef MOZ_APPLEMEDIA
++#if defined(MOZ_APPLEMEDIA) && !defined(MOZ_IOS_LEGACY)  // no VT encoder on iOS 4-7
+     if (RefPtr<PlatformEncoderModule> pem = RemoteEncoderModule::Create(
+             RemoteMediaIn::UtilityProcess_AppleMedia)) {
+       mCurrentPEMs.AppendElement(std::move(pem));
+@@ -232,7 +232,7 @@ void PEMFactory::InitContentPEMs() {
+   }
+ 
+   if (!StaticPrefs::media_use_remote_encoder_video()) {
+-#ifdef MOZ_APPLEMEDIA
++#if defined(MOZ_APPLEMEDIA) && !defined(MOZ_IOS_LEGACY)  // no VT encoder on iOS 4-7
+     RefPtr<PlatformEncoderModule> m(new AppleEncoderModule());
+     mCurrentPEMs.AppendElement(m);
+ #endif
+@@ -293,7 +293,7 @@ void PEMFactory::InitContentPEMs() {
+ }
+ 
+ void PEMFactory::InitDefaultPEMs() {
+-#ifdef MOZ_APPLEMEDIA
++#if defined(MOZ_APPLEMEDIA) && !defined(MOZ_IOS_LEGACY)  // no VT encoder on iOS 4-7
+   RefPtr<PlatformEncoderModule> m(new AppleEncoderModule());
+   mCurrentPEMs.AppendElement(m);
+ #endif
+diff --git a/dom/media/platforms/apple/AppleVTDecoder.cpp b/dom/media/platforms/apple/AppleVTDecoder.cpp
+index 8d29eaf9fc..79c31a5ce1 100644
+--- a/dom/media/platforms/apple/AppleVTDecoder.cpp
++++ b/dom/media/platforms/apple/AppleVTDecoder.cpp
+@@ -24,6 +24,10 @@
+ #include "mozilla/Logging.h"
+ #include "mozilla/TaskQueue.h"
+ #include "mozilla/gfx/gfxVars.h"
++#if defined(MOZ_IOS_LEGACY)
++#  include <legacyfox/AVSampleBufferDisplayLayer.h>  // CVPixelBufferGetIOSurface
++#  include <legacyfox/ColorSpaceNames.h>  // keys from iOS 8-11 SDKs
++#endif
+ 
+ #define LOG(...) DDMOZ_LOG(sPDMLog, mozilla::LogLevel::Debug, __VA_ARGS__)
+ #define LOGEX(_this, ...) \
+diff --git a/dom/media/platforms/moz.build b/dom/media/platforms/moz.build
+index 1bd4af56f2..ba462a22e0 100644
+--- a/dom/media/platforms/moz.build
++++ b/dom/media/platforms/moz.build
+@@ -93,11 +93,15 @@ if CONFIG["MOZ_APPLEMEDIA"]:
+     UNIFIED_SOURCES += [
+         "apple/AppleATDecoder.cpp",
+         "apple/AppleDecoderModule.cpp",
+-        "apple/AppleEncoderModule.cpp",
+         "apple/AppleUtils.cpp",
+         "apple/AppleVTDecoder.cpp",
+-        "apple/AppleVTEncoder.cpp",
+     ]
++    # VideoToolbox encoding is iOS 8; LegacyFox decodes only.
++    if not CONFIG["MOZ_IOS_LEGACY"]:
++        UNIFIED_SOURCES += [
++            "apple/AppleEncoderModule.cpp",
++            "apple/AppleVTEncoder.cpp",
++        ]
+     LOCAL_INCLUDES += [
+         "/media/libyuv/libyuv/include",
+     ]
+-- 
+2.53.0
+

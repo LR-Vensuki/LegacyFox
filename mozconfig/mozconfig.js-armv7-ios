@@ -1,0 +1,54 @@
+# SpiderMonkey alone for armv7 iOS 4-7: the first engine stage (docs/PLAN.md,
+# stage 3), as gecko-w10m began with mozconfig.arm-uwp.
+#
+#   cd engine/firefox && MOZCONFIG=../../mozconfig/mozconfig.js-armv7-ios ./mach build
+
+ac_add_options --enable-project=js
+ac_add_options --target=armv7-apple-ios
+mk_add_options MOZ_OBJDIR=${LEGACYFOX_JS_OBJ:-$HOME/lf-obj-js}
+
+ac_add_options --with-ios-sdk=${LEGACYFOX_SDK:-$HOME/theos/sdks/iPhoneOS6.1.sdk}
+export IPHONEOS_DEPLOYMENT_TARGET=${LEGACYFOX_IOS_MIN:-4.0}
+
+# Compiler, libc++, compat and Rust exactly as for the whole engine.
+LF_TC=${LEGACYFOX_TC:-$HOME/theos/toolchain/linux/iphone/bin}
+LF_CACHE=${LEGACYFOX_CACHE:-$HOME/.cache/legacyfox}
+LF_COMPAT=${LEGACYFOX_COMPAT:-$topsrcdir/../../compat}
+LF_RT=$LF_TC/../lib/clang/13.0.0/lib/darwin/libclang_rt.ios.a
+# Sysroot and linker go in CC itself: NSS's gyp files and the linker check run
+# ${CC} on their own. -B finds ld64 through a directory holding only an "ld"
+# link to the theos one (--ld-path would warn on every compile, and gyp fails
+# on any stderr output).
+LF_LD=${LEGACYFOX_LD_DIR:-$LF_CACHE/ld}
+export CC="clang -target armv7-apple-ios9.0 -isysroot ${LEGACYFOX_SDK:-$HOME/theos/sdks/iPhoneOS6.1.sdk} -B $LF_LD"
+export CXX="clang++ -target armv7-apple-ios9.0 -isysroot ${LEGACYFOX_SDK:-$HOME/theos/sdks/iPhoneOS6.1.sdk} -B $LF_LD"
+export HOST_CC=clang
+export HOST_CXX=clang++
+# Headers the 6.1 SDK lacks (sdk-overlay/README.md), searched after the SDK.
+LF_OVERLAY="-idirafter $topsrcdir/../../sdk-overlay/include"
+# -fobjc-runtime=ios-6.0: no objc_alloc or __NSArray0__ (iOS 12/14 runtime calls).
+export CFLAGS="-femulated-tls -fobjc-runtime=ios-6.0 -include $LF_COMPAT/legacyfox_compat.h $LF_OVERLAY"
+export CXXFLAGS="-femulated-tls -fobjc-runtime=ios-6.0 -include $LF_COMPAT/legacyfox_compat.h $LF_OVERLAY -nostdinc++ -isystem $LF_CACHE/libcxx-armv7/include/c++/v1"
+# sdk-overlay/Frameworks: link stubs for private frameworks (IOSurface).
+# libc++ puts operator new/delete in __TEXT,__lcxx_override; ld64 builds
+# thumb branch islands only inside __text, and XUL's text is ~80 MB, so the
+# section is merged into __text to stay reachable.
+export LDFLAGS="-Wl,-rename_section,__TEXT,__lcxx_override,__TEXT,__text -F$topsrcdir/../../sdk-overlay/Frameworks -miphoneos-version-min=$IPHONEOS_DEPLOYMENT_TARGET -nostdlib++ $LF_CACHE/libcxx-armv7/lib/libc++.a $LF_CACHE/libcxx-armv7/lib/libc++abi.a $LF_COMPAT/build/liblegacyfox_compat.a $LF_RT"
+export AR=$LF_TC/ar
+export RANLIB=$LF_TC/ranlib
+export STRIP=$LF_TC/strip
+export OTOOL=$LF_TC/otool
+
+# The target spec and its std live in the rustc sysroot: tools/rust/install-target.sh
+export RUSTFLAGS="$RUSTFLAGS -Cpanic=abort -Zunstable-options"
+export RUSTC_BOOTSTRAP=1
+ac_add_options --disable-rust-simd
+
+ac_add_options --enable-jit
+ac_add_options --enable-optimize="-Os"
+ac_add_options --disable-debug
+ac_add_options --disable-debug-symbols
+ac_add_options --disable-tests
+ac_add_options --enable-release
+ac_add_options --disable-lto
+ac_add_options --disable-ctypes

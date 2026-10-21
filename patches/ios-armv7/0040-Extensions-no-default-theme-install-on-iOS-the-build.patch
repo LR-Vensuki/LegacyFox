@@ -1,0 +1,28 @@
+From b9b4798d43a5ba7ecc7e1760d194252d43c4241f Mon Sep 17 00:00:00 2001
+From: LR-Vensuki <260785366+LR-Vensuki@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 04:02:09 +0300
+Subject: [PATCH 40/42] Extensions: no default theme install on iOS (the build
+ has none)
+
+---
+ toolkit/mozapps/extensions/internal/XPIProvider.sys.mjs | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/toolkit/mozapps/extensions/internal/XPIProvider.sys.mjs b/toolkit/mozapps/extensions/internal/XPIProvider.sys.mjs
+index 74d738e46f..5fe332bc38 100644
+--- a/toolkit/mozapps/extensions/internal/XPIProvider.sys.mjs
++++ b/toolkit/mozapps/extensions/internal/XPIProvider.sys.mjs
+@@ -2778,8 +2778,10 @@ export var XPIProvider = {
+ 
+       const isInAutomationOrXPCShellTests =
+         Cu.isInAutomation || Services.env.exists("XPCSHELL_TEST_PROFILE_DIR");
++      // Mobile builds ship no default theme (resource://default-theme/).
+       if (
+         AppConstants.platform != "android" &&
++        AppConstants.platform != "ios" &&
+         !(isInAutomationOrXPCShellTests && lazy.skipDefaultThemeInstall)
+       ) {
+         // Keep version in sync with toolkit/mozapps/extensions/default-theme/manifest.json
+-- 
+2.53.0
+

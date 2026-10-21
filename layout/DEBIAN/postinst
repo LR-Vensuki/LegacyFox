@@ -1,0 +1,14 @@
+#!/bin/sh
+# LegacyFox is ~180 MB: the app lives on the data partition and /Applications
+# only links to it (iOS 4-7 system partitions are small). Every step ends in
+# "|| true": a missing tool must never leave dpkg half-configured.
+APP=/var/mobile/Library/LegacyFox/LegacyFox.app
+chown mobile:mobile /var/mobile/Library/LegacyFox || true
+# A new version's chrome JS must not come from the old one's startup cache.
+rm -rf /var/mobile/Library/Caches/mozilla/firefox/*/startupCache || true
+if [ -d /Applications/LegacyFox.app ] && [ ! -L /Applications/LegacyFox.app ]; then
+  rm -rf /Applications/LegacyFox.app || true
+fi
+ln -sfn "$APP" /Applications/LegacyFox.app || true
+su mobile -c uicache >/dev/null 2>&1 || uicache >/dev/null 2>&1 || true
+exit 0

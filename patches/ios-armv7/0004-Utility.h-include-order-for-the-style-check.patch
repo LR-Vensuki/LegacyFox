@@ -1,0 +1,29 @@
+From 44192ed00561c396bb8398a80789bc854b0f5d17 Mon Sep 17 00:00:00 2001
+From: LR-Vensuki <260785366+LR-Vensuki@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 23:16:09 +0300
+Subject: [PATCH 04/42] Utility.h: include order for the style check
+
+---
+ js/public/Utility.h | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/js/public/Utility.h b/js/public/Utility.h
+index c1e66a2929..203ef45f87 100644
+--- a/js/public/Utility.h
++++ b/js/public/Utility.h
+@@ -12,11 +12,11 @@
+ #include "mozilla/Likely.h"
+ #include "mozilla/UniquePtr.h"
+ 
++#include <cstddef>
+ #include <stdlib.h>
+ #include <string.h>
+ #include <type_traits>
+ #include <utility>
+-#include <cstddef>
+ 
+ /*
+  * The alignment malloc (and mozjemalloc) guarantees. Everywhere but armv7
+-- 
+2.53.0
+

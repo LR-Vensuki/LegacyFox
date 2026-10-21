@@ -1,0 +1,101 @@
+From 3b392c91b15f614b4b3f06dcc2b086e3feb010bb Mon Sep 17 00:00:00 2001
+From: LR-Vensuki <260785366+LR-Vensuki@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 23:18:43 +0300
+Subject: [PATCH 38/42] Mozilla account sign-in on iOS 4-7: open the fxaccounts
+ WebChannel; BrowserWindowTracker stand-in
+
+The account pages got "No Such Channel": desktop opens the channel with
+every browser window, the shell has none, so LegacyFoxSync does it.
+Toolkit modules that ask desktop's window tracker now get an empty one
+instead of a failed import.
+---
+ .../geckoview/BrowserWindowTracker.sys.mjs    | 37 +++++++++++++++++++
+ .../modules/geckoview/LegacyFoxSync.sys.mjs   |  8 ++++
+ mobile/shared/modules/geckoview/moz.build     |  4 ++
+ 3 files changed, 49 insertions(+)
+ create mode 100644 mobile/shared/modules/geckoview/BrowserWindowTracker.sys.mjs
+
+diff --git a/mobile/shared/modules/geckoview/BrowserWindowTracker.sys.mjs b/mobile/shared/modules/geckoview/BrowserWindowTracker.sys.mjs
+new file mode 100644
+index 0000000000..eac6e5716d
+--- /dev/null
++++ b/mobile/shared/modules/geckoview/BrowserWindowTracker.sys.mjs
+@@ -0,0 +1,37 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++// LegacyFox: toolkit code (login helper, Sync, webNavigation, downloads UI)
++// asks desktop Firefox's BrowserWindowTracker for browser windows. The iOS
++// 4-7 shell has none of those windows; this one answers that there are none
++// instead of failing to load.
++
++export const BrowserWindowTracker = {
++  getTopWindow() {
++    return null;
++  },
++  getPendingWindow() {
++    return null;
++  },
++  registerOpeningWindow() {},
++  openWindow() {
++    return null;
++  },
++  get windowCount() {
++    return 0;
++  },
++  get orderedWindows() {
++    return [];
++  },
++  getOrderedWindows() {
++    return [];
++  },
++  getAllVisibleTabs() {
++    return [];
++  },
++  track() {},
++  getBrowserById() {
++    return null;
++  },
++};
+diff --git a/mobile/shared/modules/geckoview/LegacyFoxSync.sys.mjs b/mobile/shared/modules/geckoview/LegacyFoxSync.sys.mjs
+index 24fe5fc84e..4ea572e0ae 100644
+--- a/mobile/shared/modules/geckoview/LegacyFoxSync.sys.mjs
++++ b/mobile/shared/modules/geckoview/LegacyFoxSync.sys.mjs
+@@ -12,6 +12,7 @@ import { GeckoViewUtils } from "resource://gre/modules/GeckoViewUtils.sys.mjs";
+ const lazy = {};
+ 
+ ChromeUtils.defineESModuleGetters(lazy, {
++  EnsureFxAccountsWebChannel: "resource://gre/modules/FxAccountsWebChannel.sys.mjs",
+   FxAccountsConfig: "resource://gre/modules/FxAccountsConfig.sys.mjs",
+   UIState: "resource://services-sync/UIState.sys.mjs",
+   Weave: "resource://services-sync/main.sys.mjs",
+@@ -29,6 +30,13 @@ function startSync() {
+     return;
+   }
+   started = true;
++  try {
++    // The channel the account pages talk to Gecko over (desktop opens it
++    // with every browser window, browser-sync.js).
++    lazy.EnsureFxAccountsWebChannel();
++  } catch (e) {
++    warn`opening the account WebChannel: ${e}`;
++  }
+   try {
+     const weave = Cc["@mozilla.org/weave/service;1"].getService().wrappedJSObject;
+     weave.init();
+diff --git a/mobile/shared/modules/geckoview/moz.build b/mobile/shared/modules/geckoview/moz.build
+index 3e9776a788..1796893668 100644
+--- a/mobile/shared/modules/geckoview/moz.build
++++ b/mobile/shared/modules/geckoview/moz.build
+@@ -49,3 +49,7 @@ EXTRA_JS_MODULES += [
+ 
+ XPCSHELL_TESTS_MANIFESTS += ["test/xpcshell/xpcshell.toml"]
+ MOCHITEST_MANIFESTS += ["test/mochitest/mochitest.toml"]
++
++if CONFIG["MOZ_IOS_LEGACY"]:
++    # Stand-in for desktop's window tracker, which toolkit code asks for.
++    EXTRA_JS_MODULES += ["BrowserWindowTracker.sys.mjs"]
+-- 
+2.53.0
+

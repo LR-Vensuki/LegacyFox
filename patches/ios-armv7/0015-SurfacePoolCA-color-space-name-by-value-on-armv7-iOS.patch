@@ -1,0 +1,26 @@
+From 97131199e7e538dfbbe66429cdc5ccb988bf360f Mon Sep 17 00:00:00 2001
+From: LR-Vensuki <260785366+LR-Vensuki@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 23:14:26 +0300
+Subject: [PATCH 15/42] SurfacePoolCA: color space name by value on armv7 iOS
+
+---
+ gfx/layers/SurfacePoolCA.mm | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/gfx/layers/SurfacePoolCA.mm b/gfx/layers/SurfacePoolCA.mm
+index 04828808d3..27b0e9834f 100644
+--- a/gfx/layers/SurfacePoolCA.mm
++++ b/gfx/layers/SurfacePoolCA.mm
+@@ -25,6 +25,9 @@
+ 
+ #include "MozFramebuffer.h"
+ #include "ScopedGLHelpers.h"
++#if defined(MOZ_IOS_LEGACY)
++#  include <legacyfox/ColorSpaceNames.h>  // names from newer SDKs
++#endif
+ 
+ namespace mozilla {
+ namespace layers {
+-- 
+2.53.0
+

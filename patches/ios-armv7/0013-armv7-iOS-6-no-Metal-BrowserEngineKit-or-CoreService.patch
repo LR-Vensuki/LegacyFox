@@ -1,0 +1,61 @@
+From 178d049e1f056334f57e8781d2de01f726d84880 Mon Sep 17 00:00:00 2001
+From: LR-Vensuki <260785366+LR-Vensuki@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 22:57:12 +0300
+Subject: [PATCH 13/42] armv7 iOS 6: no Metal, BrowserEngineKit or CoreServices
+ frameworks
+
+---
+ config/external/nspr/pr/moz.build | 4 +++-
+ ipc/glue/moz.build                | 2 +-
+ toolkit/library/moz.build         | 4 +++-
+ 3 files changed, 7 insertions(+), 3 deletions(-)
+
+diff --git a/config/external/nspr/pr/moz.build b/config/external/nspr/pr/moz.build
+index f030dbed53..a152025375 100644
+--- a/config/external/nspr/pr/moz.build
++++ b/config/external/nspr/pr/moz.build
+@@ -41,7 +41,9 @@ elif CONFIG["OS_TARGET"] in ("FreeBSD", "OpenBSD", "NetBSD"):
+     DEFINES[CONFIG["OS_TARGET"].upper()] = True
+     SOURCES += ["/nsprpub/pr/src/md/unix/%s.c" % CONFIG["OS_TARGET"].lower()]
+ elif CONFIG["OS_TARGET"] == "Darwin":
+-    OS_LIBS += ["-framework CoreServices"]
++    # iOS before 12 has no CoreServices umbrella framework.
++    if not CONFIG["MOZ_IOS_LEGACY"]:
++        OS_LIBS += ["-framework CoreServices"]
+     # See also IncreaseDescriptorLimits in toolkit/xre/nsAppRunner.cpp
+     DEFINES["FD_SETSIZE"] = 4096
+     DEFINES["_DARWIN_UNLIMITED_SELECT"] = True
+diff --git a/ipc/glue/moz.build b/ipc/glue/moz.build
+index 3c89373fb4..8a7a5af77b 100644
+--- a/ipc/glue/moz.build
++++ b/ipc/glue/moz.build
+@@ -289,7 +289,7 @@ FINAL_LIBRARY = "xul"
+ 
+ if CONFIG["TARGET_OS"] == "OSX":
+     OS_LIBS += ["bsm"]  # for audit_token_to_pid
+-elif CONFIG["TARGET_OS"] == "iOS":
++elif CONFIG["TARGET_OS"] == "iOS" and not CONFIG["MOZ_IOS_LEGACY"]:
+     OS_LIBS += ["-framework BrowserEngineKit"]
+ elif CONFIG["MOZ_WIDGET_TOOLKIT"] == "android":
+     OS_LIBS += ["android"]
+diff --git a/toolkit/library/moz.build b/toolkit/library/moz.build
+index 377b348dfd..9fca10dc2b 100644
+--- a/toolkit/library/moz.build
++++ b/toolkit/library/moz.build
+@@ -213,10 +213,12 @@ if CONFIG["OS_ARCH"] == "Darwin":
+         "-framework CoreVideo",
+         "-framework Foundation",
+         "-framework MediaPlayer",
+-        "-framework Metal",
+         "-framework QuartzCore",
+         "-framework Security",
+     ]
++    # Metal is iOS 8; LegacyFox (armv7 iOS 4-7) composites without it.
++    if not CONFIG["MOZ_IOS_LEGACY"]:
++        OS_LIBS += ["-framework Metal"]
+ 
+ if CONFIG["MOZ_WIDGET_TOOLKIT"] == "cocoa":
+     OS_LIBS += [
+-- 
+2.53.0
+

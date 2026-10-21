@@ -1,0 +1,32 @@
+From c0011decbf94df3aa9ed59b492676788f23deeb0 Mon Sep 17 00:00:00 2001
+From: LR-Vensuki <260785366+LR-Vensuki@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 00:23:34 +0300
+Subject: [PATCH 22/42] GRE directory: the app's Frameworks/ on armv7 iOS (no
+ GeckoView.framework)
+
+---
+ toolkit/xre/nsAppRunner.cpp | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/toolkit/xre/nsAppRunner.cpp b/toolkit/xre/nsAppRunner.cpp
+index 9f7bc03001..64770f86aa 100644
+--- a/toolkit/xre/nsAppRunner.cpp
++++ b/toolkit/xre/nsAppRunner.cpp
+@@ -6428,10 +6428,14 @@ int XREMain::XRE_main(int argc, char* argv[], const BootstrapConfig& aConfig) {
+     // framework or support multiple embedders.
+     rv = greDir->AppendNative("Frameworks"_ns);
+     NS_ENSURE_SUCCESS(rv, 2);
++#  if !defined(MOZ_IOS_LEGACY)
++    // LegacyFox has no GeckoView.framework (iOS 4-7 load no embedded
++    // frameworks): XUL and Gecko's files are straight in Frameworks/.
+     rv = greDir->AppendNative("GeckoView.framework"_ns);
+     NS_ENSURE_SUCCESS(rv, 2);
+     rv = greDir->AppendNative("Frameworks"_ns);
+     NS_ENSURE_SUCCESS(rv, 2);
++#  endif
+ #endif
+ 
+     mAppData->xreDirectory = greDir;
+-- 
+2.53.0
+

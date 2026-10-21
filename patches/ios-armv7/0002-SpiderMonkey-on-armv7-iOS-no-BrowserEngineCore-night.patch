@@ -1,0 +1,62 @@
+From ba6611ec54525e8dc338df530f1459109efd6f13 Mon Sep 17 00:00:00 2001
+From: LR-Vensuki <260785366+LR-Vensuki@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 23:07:35 +0300
+Subject: [PATCH 02/42] SpiderMonkey on armv7 iOS: no BrowserEngineCore,
+ nightly features for the custom Rust target
+
+---
+ config/makefiles/rust.mk             | 8 ++++++++
+ js/src/build/moz.build               | 2 +-
+ js/src/jit/ProcessExecutableMemory.h | 4 +++-
+ 3 files changed, 12 insertions(+), 2 deletions(-)
+
+diff --git a/config/makefiles/rust.mk b/config/makefiles/rust.mk
+index 06893db33c..915da86d85 100644
+--- a/config/makefiles/rust.mk
++++ b/config/makefiles/rust.mk
+@@ -310,6 +310,14 @@ endif
+ # for libz-rs-sys, since we still use the headers from there.
+ export LIBZ_RS_SYS_PREFIX=MOZ_Z_
+ 
++# LegacyFox: the armv7 iOS target spec and its std live in the rustc sysroot
++# (tools/rust/install-target.sh); a target spec is a nightly feature for
++# every crate that is built for it.
++ifeq (armv7-apple-ios-legacy,$(RUST_TARGET))
++RUSTC_BOOTSTRAP := 1
++export RUSTC_BOOTSTRAP
++endif
++
+ ifndef RUSTC_BOOTSTRAP
+ RUSTC_BOOTSTRAP := mozglue_static,qcms
+ ifdef MOZ_RUST_SIMD
+diff --git a/js/src/build/moz.build b/js/src/build/moz.build
+index 2d5343a58e..1367e18080 100644
+--- a/js/src/build/moz.build
++++ b/js/src/build/moz.build
+@@ -90,7 +90,7 @@ if CONFIG["OS_ARCH"] == "WINNT":
+ 
+ OS_LIBS += CONFIG["LIBATOMIC_LIBS"]
+ 
+-if CONFIG["TARGET_OS"] == "iOS":
++if CONFIG["TARGET_OS"] == "iOS" and CONFIG["TARGET_CPU"] == "aarch64":
+     OS_LIBS += ["-framework BrowserEngineCore"]
+ 
+ OS_LIBS += CONFIG["REALTIME_LIBS"]
+diff --git a/js/src/jit/ProcessExecutableMemory.h b/js/src/jit/ProcessExecutableMemory.h
+index 4a08d4a623..5e3b4e010b 100644
+--- a/js/src/jit/ProcessExecutableMemory.h
++++ b/js/src/jit/ProcessExecutableMemory.h
+@@ -7,7 +7,9 @@
+ 
+ #include "util/Poison.h"
+ 
+-#ifdef XP_IOS
++// BrowserEngineCore (iOS 17.4+) is the arm64 path; 32-bit ARM on old iOS
++// gets plain mmap/mprotect with the dynamic-codesigning entitlement.
++#if defined(XP_IOS) && defined(JS_USE_APPLE_FAST_WX)
+ #  include <BrowserEngineCore/BEMemory.h>
+ #endif
+ 
+-- 
+2.53.0
+

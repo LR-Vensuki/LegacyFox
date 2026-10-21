@@ -1,0 +1,12 @@
+#!/bin/sh
+# Drop the /Applications link (see postinst) and refresh SpringBoard. The
+# profile in /var/mobile/Library/Application Support/.mozilla stays unless
+# the package is purged.
+if [ "$1" = remove ] || [ "$1" = purge ]; then
+  [ -L /Applications/LegacyFox.app ] && rm -f /Applications/LegacyFox.app
+  su mobile -c uicache >/dev/null 2>&1 || uicache >/dev/null 2>&1 || true
+fi
+if [ "$1" = purge ]; then
+  rm -rf "/var/mobile/Library/Application Support/.mozilla" /var/mobile/Library/LegacyFox || true
+fi
+exit 0

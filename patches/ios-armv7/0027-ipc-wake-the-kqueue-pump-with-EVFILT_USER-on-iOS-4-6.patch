@@ -1,0 +1,87 @@
+From 8849585302ecdaa137791efb228d965da22ce48d Mon Sep 17 00:00:00 2001
+From: LR-Vensuki <260785366+LR-Vensuki@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 12:59:34 +0300
+Subject: [PATCH 27/42] ipc: wake the kqueue pump with EVFILT_USER on iOS 4-6
+
+EVFILT_MACHPORT watches only port sets there and cannot receive the
+message, so tasks posted to the IPC I/O thread waited for an unrelated
+event. Same-process PBackground actors (localStorage) stalled up to the
+50 s failsafe.
+---
+ ipc/chromium/src/base/message_pump_kqueue.cc | 32 ++++++++++++++++++++
+ 1 file changed, 32 insertions(+)
+
+diff --git a/ipc/chromium/src/base/message_pump_kqueue.cc b/ipc/chromium/src/base/message_pump_kqueue.cc
+index 6dd2c27ce0..e37a7d4a3b 100644
+--- a/ipc/chromium/src/base/message_pump_kqueue.cc
++++ b/ipc/chromium/src/base/message_pump_kqueue.cc
+@@ -106,6 +106,24 @@ void MessagePumpKqueue::MachPortWatchController::Reset() {
+   pump_ = nullptr;
+ }
+ 
++#ifdef MOZ_IOS_LEGACY
++// Before iOS 7, EVFILT_MACHPORT watches only port sets and cannot receive the
++// message itself, so the Mach port wakeup below never fires and posted tasks
++// wait for some unrelated event. An EVFILT_USER event wakes the pump instead.
++static const uintptr_t kWakeupIdent = 0x4c46;  // 'LF'
++
++MessagePumpKqueue::MessagePumpKqueue() : kqueue_(kqueue()) {
++  DCHECK(kqueue_) << "kqueue";
++
++  kevent64_s event{};
++  event.ident = kWakeupIdent;
++  event.filter = EVFILT_USER;
++  event.flags = EV_ADD | EV_CLEAR;
++
++  int rv = ChangeOneEvent(kqueue_, &event);
++  DCHECK(rv == 0) << "kevent64";
++}
++#else
+ MessagePumpKqueue::MessagePumpKqueue() : kqueue_(kqueue()) {
+   DCHECK(kqueue_) << "kqueue";
+ 
+@@ -132,6 +150,7 @@ MessagePumpKqueue::MessagePumpKqueue() : kqueue_(kqueue()) {
+   int rv = ChangeOneEvent(kqueue_, &event);
+   DCHECK(rv == 0) << "kevent64";
+ }
++#endif
+ 
+ MessagePumpKqueue::~MessagePumpKqueue() = default;
+ 
+@@ -169,6 +188,13 @@ void MessagePumpKqueue::Quit() {
+ }
+ 
+ void MessagePumpKqueue::ScheduleWork() {
++#ifdef MOZ_IOS_LEGACY
++  kevent64_s event{};
++  event.ident = kWakeupIdent;
++  event.filter = EVFILT_USER;
++  event.fflags = NOTE_TRIGGER;
++  ChangeOneEvent(kqueue_, &event);
++#else
+   mach_msg_empty_send_t message{};
+   message.header.msgh_size = sizeof(message);
+   message.header.msgh_bits =
+@@ -186,6 +212,7 @@ void MessagePumpKqueue::ScheduleWork() {
+     }
+     mach_msg_destroy(&message.header);
+   }
++#endif
+ }
+ 
+ void MessagePumpKqueue::ScheduleDelayedWork(
+@@ -400,6 +427,11 @@ bool MessagePumpKqueue::ProcessEvents(Delegate* delegate, int count) {
+       if (controller) {
+         controller->watcher()->OnMachMessageReceived(port);
+       }
++#ifdef MOZ_IOS_LEGACY
++    } else if (event->filter == EVFILT_USER) {
++      // The wakeup event: as with the Mach port, not "work" by itself.
++      continue;
++#endif
+     } else if (event->filter == EVFILT_TIMER) {
+       // The wakeup timer fired.
+       DCHECK(!delayed_work_time_.is_null());
+-- 
+2.53.0
+

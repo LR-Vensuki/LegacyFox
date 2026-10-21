@@ -1,0 +1,70 @@
+From 565d48136108b2be488900ce7ac8303b5a77f1b9 Mon Sep 17 00:00:00 2001
+From: LR-Vensuki <260785366+LR-Vensuki@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 09:08:39 +0300
+Subject: [PATCH 42/42] LegacyFoxPlaces: fetch and keep a page's /favicon.ico
+ (GeckoView stores no site icons)
+
+---
+ .../geckoview/GeckoViewStartup.sys.mjs        |  1 +
+ .../modules/geckoview/LegacyFoxPlaces.sys.mjs | 33 +++++++++++++++++++
+ 2 files changed, 34 insertions(+)
+
+diff --git a/mobile/shared/components/geckoview/GeckoViewStartup.sys.mjs b/mobile/shared/components/geckoview/GeckoViewStartup.sys.mjs
+index 547bff75f7..83a390311f 100644
+--- a/mobile/shared/components/geckoview/GeckoViewStartup.sys.mjs
++++ b/mobile/shared/components/geckoview/GeckoViewStartup.sys.mjs
+@@ -150,6 +150,7 @@ export class GeckoViewStartup {
+               "LegacyFox:Places:RemoveHistory",
+               "LegacyFox:Places:ClearHistory",
+               "LegacyFox:Places:Favicons",
++              "LegacyFox:Places:FetchIcon",
+             ],
+           });
+           GeckoViewUtils.addLazyGetter(this, "LegacyFoxSync", {
+diff --git a/mobile/shared/modules/geckoview/LegacyFoxPlaces.sys.mjs b/mobile/shared/modules/geckoview/LegacyFoxPlaces.sys.mjs
+index f5f331efca..5e8aab2a22 100644
+--- a/mobile/shared/modules/geckoview/LegacyFoxPlaces.sys.mjs
++++ b/mobile/shared/modules/geckoview/LegacyFoxPlaces.sys.mjs
+@@ -139,6 +139,39 @@ export const LegacyFoxPlaces = {
+           await lazy.PlacesUtils.history.clear();
+           aCallback.onSuccess(true);
+           break;
++        case "LegacyFox:Places:FetchIcon": {
++          // GeckoView keeps no site icons (desktop Firefox's FaviconLoader
++          // does): after a page loads, the shell asks for its /favicon.ico,
++          // which Places stores (as PNG) for the lists and other devices.
++          const page = Services.io.newURI(aData.url);
++          let icon = null;
++          try {
++            icon = await lazy.PlacesUtils.favicons.getFaviconForPage(page, 32);
++          } catch (e) {}
++          if (!icon?.dataURI) {
++            const iconURL = `${page.prePath}/favicon.ico`;
++            const response = await fetch(iconURL, { credentials: "omit" });
++            const type = response.headers.get("Content-Type") ?? "";
++            if (response.ok && /^image\//.test(type)) {
++              const bytes = new Uint8Array(await response.arrayBuffer());
++              if (bytes.length && bytes.length < 128 * 1024) {
++                let binary = "";
++                for (let i = 0; i < bytes.length; i += 8192) {
++                  binary += String.fromCharCode(...bytes.subarray(i, i + 8192));
++                }
++                const dataURL = `data:${type.split(";")[0]};base64,${btoa(binary)}`;
++                await lazy.PlacesUtils.favicons.setFaviconForPage(
++                  page,
++                  Services.io.newURI(iconURL),
++                  Services.io.newURI(dataURL)
++                );
++                icon = await lazy.PlacesUtils.favicons.getFaviconForPage(page, 32);
++              }
++            }
++          }
++          aCallback.onSuccess(icon?.dataURI?.spec ?? null);
++          break;
++        }
+         case "LegacyFox:Places:Favicons": {
+           // Site icons for the shell's lists: { url: "data:..." }, 32 px
+           // where there is a choice (Firefox for Android's list icons).
+-- 
+2.53.0
+

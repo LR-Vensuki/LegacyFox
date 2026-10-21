@@ -1,0 +1,29 @@
+From cf71b4ed622da97b455467f17efc1773e215b050 Mon Sep 17 00:00:00 2001
+From: LR-Vensuki <260785366+LR-Vensuki@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 00:04:15 +0300
+Subject: [PATCH 19/42] mfbt ThreadLocal: native thread_local on armv7 iOS
+ (pthread slot 0 is not NULL on Darwin)
+
+---
+ mfbt/ThreadLocal.h | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/mfbt/ThreadLocal.h b/mfbt/ThreadLocal.h
+index d4cf9a295e..dfc86a5a33 100644
+--- a/mfbt/ThreadLocal.h
++++ b/mfbt/ThreadLocal.h
+@@ -20,7 +20,10 @@ namespace mozilla {
+ 
+ namespace detail {
+ 
+-#ifdef XP_MACOSX
++// LegacyFox (armv7 iOS 4-7): thread_local works there through emulated TLS,
++// and the pthread-key fallback would read slot 0 -- on Darwin the thread's
++// own pointer, not NULL -- from any thread-local that was never init()ed.
++#if defined(XP_MACOSX) || defined(MOZ_IOS_LEGACY)
+ #  if defined(__has_feature)
+ #    if __has_feature(cxx_thread_local)
+ #      define MACOSX_HAS_THREAD_LOCAL
+-- 
+2.53.0
+

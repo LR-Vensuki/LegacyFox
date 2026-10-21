@@ -1,0 +1,95 @@
+From 2a9b306f12c3ec03f39d0d06d05ea16fdcd4d662 Mon Sep 17 00:00:00 2001
+From: LR-Vensuki <260785366+LR-Vensuki@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 01:17:18 +0300
+Subject: [PATCH 07/42] SpiderMonkey runs on iOS 6: plain mutexes, Unix JIT
+ memory scheme on armv7 iOS; NSPR without connectx
+
+---
+ config/external/nspr/pr/moz.build      |  4 +++-
+ js/src/jit/ProcessExecutableMemory.cpp | 12 ++++++++----
+ mozglue/misc/Mutex_posix.cpp           |  4 +++-
+ 3 files changed, 14 insertions(+), 6 deletions(-)
+
+diff --git a/config/external/nspr/pr/moz.build b/config/external/nspr/pr/moz.build
+index bb691f97dd..f030dbed53 100644
+--- a/config/external/nspr/pr/moz.build
++++ b/config/external/nspr/pr/moz.build
+@@ -45,7 +45,9 @@ elif CONFIG["OS_TARGET"] == "Darwin":
+     # See also IncreaseDescriptorLimits in toolkit/xre/nsAppRunner.cpp
+     DEFINES["FD_SETSIZE"] = 4096
+     DEFINES["_DARWIN_UNLIMITED_SELECT"] = True
+-    DEFINES["HAS_CONNECTX"] = True
++    # connectx came with iOS 9 (LegacyFox runs iOS 4-7)
++    if not CONFIG["MOZ_IOS_LEGACY"]:
++        DEFINES["HAS_CONNECTX"] = True
+     DEFINES["DARWIN"] = True
+     DEFINES["HAVE_BSD_FLOCK"] = True
+     DEFINES["HAVE_SOCKLEN_T"] = True
+diff --git a/js/src/jit/ProcessExecutableMemory.cpp b/js/src/jit/ProcessExecutableMemory.cpp
+index cea7d764ca..e7e7eb8b5f 100644
+--- a/js/src/jit/ProcessExecutableMemory.cpp
++++ b/js/src/jit/ProcessExecutableMemory.cpp
+@@ -501,13 +501,17 @@ static void* ReserveProcessExecutableMemory(size_t bytes) {
+   //             2) madvise with MADV_FREE_REUSABLE
+   //
+   // This is inspired by V8's code in OS::SetPermissions.
++  //
++  // armv7 iOS 4-7 (MOZ_IOS_LEGACY) predates all of this: there is no
++  // MADV_FREE_REUSE dance to do, and a jailbroken device with the
++  // dynamic-codesigning entitlement takes the plain Unix scheme above.
+ 
+   // Note that randomAddr is just a hint: if the address is not available
+   // mmap will pick a different address.
+   void* randomAddr = ComputeRandomAllocationAddress();
+   unsigned protection = PROT_NONE;
+   unsigned flags = MAP_NORESERVE | MAP_PRIVATE | MAP_ANON;
+-#  if defined(XP_DARWIN)
++#  if defined(XP_DARWIN) && !defined(MOZ_IOS_LEGACY)
+   flags |= MAP_JIT;
+ #    if defined(JS_USE_APPLE_FAST_WX)
+   protection = PROT_READ | PROT_WRITE | PROT_EXEC;
+@@ -518,7 +522,7 @@ static void* ReserveProcessExecutableMemory(size_t bytes) {
+   if (p == MAP_FAILED) {
+     return nullptr;
+   }
+-#  if defined(XP_DARWIN)
++#  if defined(XP_DARWIN) && !defined(MOZ_IOS_LEGACY)
+   DecommitPages(p, bytes);
+ #  endif
+   return p;
+@@ -562,7 +566,7 @@ static unsigned ProtectionSettingToFlags(ProtectionSetting protection) {
+ [[nodiscard]] static bool CommitPages(void* addr, size_t bytes,
+                                       ProtectionSetting protection) {
+   // See the comment in ReserveProcessExecutableMemory.
+-#  if defined(XP_DARWIN)
++#  if defined(XP_DARWIN) && !defined(MOZ_IOS_LEGACY)
+   int ret;
+   do {
+     ret = madvise(addr, bytes, MADV_FREE_REUSE);
+@@ -592,7 +596,7 @@ static unsigned ProtectionSettingToFlags(ProtectionSetting protection) {
+ 
+ static void DecommitPages(void* addr, size_t bytes) {
+   // See the comment in ReserveProcessExecutableMemory.
+-#  if defined(XP_DARWIN)
++#  if defined(XP_DARWIN) && !defined(MOZ_IOS_LEGACY)
+   int ret;
+ #    if !defined(JS_USE_APPLE_FAST_WX)
+   ret = mprotect(addr, bytes, PROT_NONE);
+diff --git a/mozglue/misc/Mutex_posix.cpp b/mozglue/misc/Mutex_posix.cpp
+index 6ca4ca75cf..3d839473fc 100644
+--- a/mozglue/misc/Mutex_posix.cpp
++++ b/mozglue/misc/Mutex_posix.cpp
+@@ -39,7 +39,9 @@ mozilla::detail::MutexImpl::MutexImpl() {
+ // too, and it seems like a reasonable thing to do.
+ #elif (defined(__linux__) && defined(__GLIBC__)) || defined(__FreeBSD__)
+ #  define MUTEX_KIND PTHREAD_MUTEX_ADAPTIVE_NP
+-#elif defined(XP_DARWIN)
++// The firstfit policy came with macOS 10.14 / iOS 12; older iOS (LegacyFox)
++// rejects it, so plain mutexes there.
++#elif defined(XP_DARWIN) && !defined(MOZ_IOS_LEGACY)
+ #  if defined(PTHREAD_MUTEX_POLICY_FIRSTFIT_NP)
+ #    define POLICY_KIND PTHREAD_MUTEX_POLICY_FIRSTFIT_NP
+ #  else
+-- 
+2.53.0
+

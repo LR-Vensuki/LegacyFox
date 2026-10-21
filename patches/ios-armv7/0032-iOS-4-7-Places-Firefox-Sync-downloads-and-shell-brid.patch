@@ -1,0 +1,517 @@
+From 5014872cb2f643a7c043c9d398fb905c5ef54f74 Mon Sep 17 00:00:00 2001
+From: LR-Vensuki <260785366+LR-Vensuki@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 18:44:20 +0300
+Subject: [PATCH 32/42] iOS 4-7: Places, Firefox Sync, downloads and shell
+ bridges
+
+mobile/ios on MOZ_IOS_LEGACY builds Places and Sync, as desktop does, in
+place of GeckoView's app-side history. LegacyFoxPlaces, LegacyFoxSync and
+LegacyFoxDownloads give the shell Top Sites, bookmarks, history, the
+Mozilla account (WebChannel sign-in) and the download list. Downloads go
+through Gecko's helper app service, which uikit left unregistered, with a
+plain save-to-disk MIME info.
+---
+ docshell/build/components.conf                |   3 +-
+ mobile/ios/moz.configure                      |  11 +-
+ .../geckoview/GeckoViewStartup.sys.mjs        |  32 ++++
+ .../geckoview/LegacyFoxDownloads.sys.mjs      | 111 +++++++++++++
+ .../modules/geckoview/LegacyFoxPlaces.sys.mjs | 146 ++++++++++++++++++
+ .../modules/geckoview/LegacyFoxSync.sys.mjs   |  85 ++++++++++
+ mobile/shared/modules/geckoview/moz.build     |   3 +
+ .../exthandler/uikit/nsOSHelperAppService.mm  |  15 ++
+ 8 files changed, 404 insertions(+), 2 deletions(-)
+ create mode 100644 mobile/shared/modules/geckoview/LegacyFoxDownloads.sys.mjs
+ create mode 100644 mobile/shared/modules/geckoview/LegacyFoxPlaces.sys.mjs
+ create mode 100644 mobile/shared/modules/geckoview/LegacyFoxSync.sys.mjs
+
+diff --git a/docshell/build/components.conf b/docshell/build/components.conf
+index 8173a460fd..fe63f816cf 100644
+--- a/docshell/build/components.conf
++++ b/docshell/build/components.conf
+@@ -156,7 +156,8 @@ Classes = [
+     },
+ ]
+ 
+-if buildconfig.substs['MOZ_WIDGET_TOOLKIT'] in ('android', 'uikit'):
++# LegacyFox (iOS 4-7) downloads files with Gecko's own helper app service.
++if buildconfig.substs['MOZ_WIDGET_TOOLKIT'] in ('android', 'uikit') and not buildconfig.substs.get('MOZ_IOS_LEGACY'):
+     Classes += [
+         # Android has its own externel-helper-app-service, so we omit
+         # that here for nsExternalHelperAppService.
+diff --git a/mobile/ios/moz.configure b/mobile/ios/moz.configure
+index e4031d452d..e476b411a0 100644
+--- a/mobile/ios/moz.configure
++++ b/mobile/ios/moz.configure
+@@ -2,7 +2,16 @@
+ # License, v. 2.0. If a copy of the MPL was not distributed with this
+ # file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ 
+-imply_option("MOZ_GECKOVIEW_HISTORY", True)
++# LegacyFox keeps history and bookmarks in Places, as desktop Firefox does,
++# so that Firefox Sync can carry them (and passwords) with a Mozilla account.
++@depends(target_is_ios_legacy)
++def geckoview_history(legacy):
++    return not legacy
++
++
++imply_option("MOZ_GECKOVIEW_HISTORY", geckoview_history, reason="LegacyFox")
++imply_option("MOZ_PLACES", target_is_ios_legacy, reason="LegacyFox")
++imply_option("MOZ_SERVICES_SYNC", target_is_ios_legacy, reason="LegacyFox")
+ 
+ imply_option("MOZ_APP_VENDOR", "Mozilla")
+ imply_option("MOZ_APP_ID", "{8e3ba928-3798-4bcd-9b64-c788f2d954d3}")
+diff --git a/mobile/shared/components/geckoview/GeckoViewStartup.sys.mjs b/mobile/shared/components/geckoview/GeckoViewStartup.sys.mjs
+index 57c4c1de29..9f6c333254 100644
+--- a/mobile/shared/components/geckoview/GeckoViewStartup.sys.mjs
++++ b/mobile/shared/components/geckoview/GeckoViewStartup.sys.mjs
+@@ -127,6 +127,38 @@ export class GeckoViewStartup {
+               "LegacyFox:Logins:Remove",
+             ],
+           });
++          GeckoViewUtils.addLazyGetter(this, "LegacyFoxDownloads", {
++            module: "resource://gre/modules/LegacyFoxDownloads.sys.mjs",
++            ged: [
++              "LegacyFox:Downloads:List",
++              "LegacyFox:Downloads:Cancel",
++              "LegacyFox:Downloads:Retry",
++              "LegacyFox:Downloads:Remove",
++            ],
++          });
++          GeckoViewUtils.addLazyGetter(this, "LegacyFoxPlaces", {
++            module: "resource://gre/modules/LegacyFoxPlaces.sys.mjs",
++            ged: [
++              "LegacyFox:Places:TopSites",
++              "LegacyFox:Places:History",
++              "LegacyFox:Places:Bookmarks",
++              "LegacyFox:Places:Search",
++              "LegacyFox:Places:IsBookmarked",
++              "LegacyFox:Places:AddBookmark",
++              "LegacyFox:Places:RemoveBookmark",
++              "LegacyFox:Places:RemoveHistory",
++              "LegacyFox:Places:ClearHistory",
++            ],
++          });
++          GeckoViewUtils.addLazyGetter(this, "LegacyFoxSync", {
++            module: "resource://gre/modules/LegacyFoxSync.sys.mjs",
++            ged: [
++              "LegacyFox:Sync:State",
++              "LegacyFox:Sync:SignInURL",
++              "LegacyFox:Sync:SyncNow",
++              "LegacyFox:Sync:SignOut",
++            ],
++          });
+         }
+ 
+         GeckoViewUtils.addLazyGetter(this, "GeckoViewStorageController", {
+diff --git a/mobile/shared/modules/geckoview/LegacyFoxDownloads.sys.mjs b/mobile/shared/modules/geckoview/LegacyFoxDownloads.sys.mjs
+new file mode 100644
+index 0000000000..a56dafcb6d
+--- /dev/null
++++ b/mobile/shared/modules/geckoview/LegacyFoxDownloads.sys.mjs
+@@ -0,0 +1,111 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++// LegacyFox: files the iOS 4-7 shell downloads go straight to the
++// downloads folder (prefs in legacyfox.js); its Downloads screen lists,
++// cancels and forgets them through these runtime events.
++
++import { GeckoViewUtils } from "resource://gre/modules/GeckoViewUtils.sys.mjs";
++
++const lazy = {};
++
++ChromeUtils.defineESModuleGetters(lazy, {
++  Downloads: "resource://gre/modules/Downloads.sys.mjs",
++  EventDispatcher: "resource://gre/modules/Messaging.sys.mjs",
++});
++
++const { warn } = GeckoViewUtils.initLogging("LegacyFoxDownloads");
++
++function describe(d) {
++  return {
++    id: d.target.path,
++    url: d.source.url,
++    path: d.target.path,
++    name: PathUtils.filename(d.target.path),
++    contentType: d.contentType ?? "",
++    progress: d.hasProgress ? d.progress : -1,
++    currentBytes: d.currentBytes,
++    totalBytes: d.totalBytes,
++    succeeded: d.succeeded,
++    stopped: d.stopped,
++    canceled: d.canceled,
++    error: d.error ? String(d.error.message || d.error) : null,
++    startTime: d.startTime ? d.startTime.getTime() : 0,
++  };
++}
++
++async function find(path) {
++  const list = await lazy.Downloads.getList(lazy.Downloads.ALL);
++  return (await list.getAll()).find(d => d.target.path == path);
++}
++
++let watching = false;
++
++// The shell shows a note when a download starts and when it ends.
++async function watch() {
++  if (watching) {
++    return;
++  }
++  watching = true;
++  const list = await lazy.Downloads.getList(lazy.Downloads.ALL);
++  const done = new WeakSet();
++  await list.addView({
++    onDownloadAdded(d) {
++      if (!d.stopped) {
++        lazy.EventDispatcher.instance.sendRequest("LegacyFox:Downloads:Started", describe(d));
++      }
++    },
++    onDownloadChanged(d) {
++      if (d.succeeded && !done.has(d)) {
++        done.add(d);
++        lazy.EventDispatcher.instance.sendRequest("LegacyFox:Downloads:Finished", describe(d));
++      }
++    },
++  });
++}
++
++export const LegacyFoxDownloads = {
++  async onEvent(aEvent, aData, aCallback) {
++    try {
++      await watch();
++      switch (aEvent) {
++        case "LegacyFox:Downloads:List": {
++          const list = await lazy.Downloads.getList(lazy.Downloads.ALL);
++          const all = (await list.getAll()).map(describe);
++          all.sort((a, b) => b.startTime - a.startTime);
++          aCallback.onSuccess(all);
++          break;
++        }
++        case "LegacyFox:Downloads:Cancel": {
++          const d = await find(aData.id);
++          await d?.finalize(true);
++          aCallback.onSuccess(!!d);
++          break;
++        }
++        case "LegacyFox:Downloads:Retry": {
++          const d = await find(aData.id);
++          d?.start().catch(() => {});
++          aCallback.onSuccess(!!d);
++          break;
++        }
++        case "LegacyFox:Downloads:Remove": {
++          const d = await find(aData.id);
++          if (d) {
++            const list = await lazy.Downloads.getList(lazy.Downloads.ALL);
++            await list.remove(d);
++            await d.finalize(true);
++            if (aData.deleteFile) {
++              await IOUtils.remove(d.target.path, { ignoreAbsent: true });
++            }
++          }
++          aCallback.onSuccess(!!d);
++          break;
++        }
++      }
++    } catch (e) {
++      warn`${aEvent}: ${e}`;
++      aCallback.onError(String(e));
++    }
++  },
++};
+diff --git a/mobile/shared/modules/geckoview/LegacyFoxPlaces.sys.mjs b/mobile/shared/modules/geckoview/LegacyFoxPlaces.sys.mjs
+new file mode 100644
+index 0000000000..2b7cc999af
+--- /dev/null
++++ b/mobile/shared/modules/geckoview/LegacyFoxPlaces.sys.mjs
+@@ -0,0 +1,146 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++// LegacyFox: the iOS 4-7 shell's Top Sites, bookmarks and history come from
++// Places, which Gecko fills as pages load and Firefox Sync carries between
++// devices. Bookmarks made on the device go to "Mobile Bookmarks", as in
++// Firefox for Android.
++
++import { GeckoViewUtils } from "resource://gre/modules/GeckoViewUtils.sys.mjs";
++
++const lazy = {};
++
++ChromeUtils.defineESModuleGetters(lazy, {
++  PlacesUtils: "resource://gre/modules/PlacesUtils.sys.mjs",
++});
++
++const { warn } = GeckoViewUtils.initLogging("LegacyFoxPlaces");
++
++const SITE_COLUMNS = "h.url, h.title, h.visit_count, h.last_visit_date";
++
++function site(row) {
++  return {
++    url: row.getResultByName("url"),
++    title: row.getResultByName("title") ?? "",
++    visits: row.getResultByName("visit_count") ?? 0,
++    lastVisit: Math.floor((row.getResultByName("last_visit_date") ?? 0) / 1000),
++  };
++}
++
++async function query(sql, params = {}) {
++  const db = await lazy.PlacesUtils.promiseDBConnection();
++  const rows = await db.executeCached(sql, params);
++  return rows.map(site);
++}
++
++// Only pages people read: no search results, no redirects in between.
++// (Sqlite.sys.mjs refuses LIKE with literals, hence substr and instr.)
++const READABLE = `h.hidden = 0 AND substr(h.url, 1, 4) = 'http'`;
++
++async function bookmarkedUrls(urls) {
++  const result = new Set();
++  for (const url of urls) {
++    if (await lazy.PlacesUtils.bookmarks.fetch({ url })) {
++      result.add(url);
++    }
++  }
++  return result;
++}
++
++export const LegacyFoxPlaces = {
++  async onEvent(aEvent, aData, aCallback) {
++    try {
++      const limit = aData?.limit ?? 30;
++      switch (aEvent) {
++        case "LegacyFox:Places:TopSites":
++          aCallback.onSuccess(
++            await query(
++              `SELECT ${SITE_COLUMNS} FROM moz_places h
++               WHERE ${READABLE} AND h.frecency > 0 AND instr(h.url, 'q=') = 0
++               ORDER BY h.frecency DESC LIMIT :limit`,
++              { limit }
++            )
++          );
++          break;
++        case "LegacyFox:Places:History":
++          aCallback.onSuccess(
++            await query(
++              `SELECT ${SITE_COLUMNS} FROM moz_places h
++               WHERE ${READABLE} AND h.last_visit_date NOT NULL
++               ORDER BY h.last_visit_date DESC LIMIT :limit`,
++              { limit }
++            )
++          );
++          break;
++        case "LegacyFox:Places:Bookmarks":
++          aCallback.onSuccess(
++            await query(
++              `SELECT h.url, COALESCE(NULLIF(b.title, ''), h.title) AS title,
++                      h.visit_count, h.last_visit_date FROM moz_bookmarks b
++               JOIN moz_places h ON h.id = b.fk
++               WHERE b.type = 1 AND substr(h.url, 1, 4) = 'http'
++               ORDER BY b.dateAdded DESC LIMIT :limit`,
++              { limit }
++            )
++          );
++          break;
++        case "LegacyFox:Places:Search": {
++          // Every word must appear in the address or the title; bookmarks
++          // first, then by frecency.
++          const words = String(aData.text ?? "")
++            .toLowerCase()
++            .split(/\s+/)
++            .filter(w => w);
++          const params = { limit };
++          const conds = words.map((w, i) => {
++            params["w" + i] = "%" + w.replace(/[%_\\]/g, "\\$&") + "%";
++            return `(lower(h.url) LIKE :w${i} ESCAPE '\\' OR lower(h.title) LIKE :w${i} ESCAPE '\\')`;
++          });
++          const rows = await query(
++            `SELECT ${SITE_COLUMNS} FROM moz_places h
++             WHERE ${READABLE} ${conds.length ? "AND " + conds.join(" AND ") : ""}
++             ORDER BY EXISTS (SELECT 1 FROM moz_bookmarks b WHERE b.fk = h.id) DESC,
++                      h.frecency DESC LIMIT :limit`,
++            params
++          );
++          aCallback.onSuccess(rows);
++          break;
++        }
++        case "LegacyFox:Places:IsBookmarked": {
++          const marked = await bookmarkedUrls([aData.url]);
++          aCallback.onSuccess(marked.has(aData.url));
++          break;
++        }
++        case "LegacyFox:Places:AddBookmark":
++          await lazy.PlacesUtils.bookmarks.insert({
++            parentGuid: lazy.PlacesUtils.bookmarks.mobileGuid,
++            url: aData.url,
++            title: aData.title || aData.url,
++          });
++          aCallback.onSuccess(true);
++          break;
++        case "LegacyFox:Places:RemoveBookmark": {
++          const found = [];
++          await lazy.PlacesUtils.bookmarks.fetch({ url: aData.url }, b => found.push(b));
++          for (const b of found) {
++            await lazy.PlacesUtils.bookmarks.remove(b.guid);
++          }
++          aCallback.onSuccess(found.length);
++          break;
++        }
++        case "LegacyFox:Places:RemoveHistory":
++          await lazy.PlacesUtils.history.remove(aData.url);
++          aCallback.onSuccess(true);
++          break;
++        case "LegacyFox:Places:ClearHistory":
++          await lazy.PlacesUtils.history.clear();
++          aCallback.onSuccess(true);
++          break;
++      }
++    } catch (e) {
++      warn`${aEvent}: ${e}`;
++      aCallback.onError(String(e));
++    }
++  },
++};
+diff --git a/mobile/shared/modules/geckoview/LegacyFoxSync.sys.mjs b/mobile/shared/modules/geckoview/LegacyFoxSync.sys.mjs
+new file mode 100644
+index 0000000000..24fe5fc84e
+--- /dev/null
++++ b/mobile/shared/modules/geckoview/LegacyFoxSync.sys.mjs
+@@ -0,0 +1,85 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++// LegacyFox: Mozilla account and Firefox Sync for the iOS 4-7 shell, done
++// the way desktop Firefox does them (the account page talks to Gecko over
++// the fxaccounts WebChannel, Sync runs in Gecko on Places and the login
++// store). The shell's account screen uses these runtime events.
++
++import { GeckoViewUtils } from "resource://gre/modules/GeckoViewUtils.sys.mjs";
++
++const lazy = {};
++
++ChromeUtils.defineESModuleGetters(lazy, {
++  FxAccountsConfig: "resource://gre/modules/FxAccountsConfig.sys.mjs",
++  UIState: "resource://services-sync/UIState.sys.mjs",
++  Weave: "resource://services-sync/main.sys.mjs",
++  getFxAccountsSingleton: "resource://gre/modules/FxAccounts.sys.mjs",
++});
++
++const { debug, warn } = GeckoViewUtils.initLogging("LegacyFoxSync");
++
++let started = false;
++
++// Like BrowserGlue: start the Sync service so that it notices a sign-in
++// and syncs on its schedule from then on.
++function startSync() {
++  if (started) {
++    return;
++  }
++  started = true;
++  try {
++    const weave = Cc["@mozilla.org/weave/service;1"].getService().wrappedJSObject;
++    weave.init();
++    weave.whenLoaded().then(() => {
++      if (weave.enabled) {
++        lazy.Weave.Service.scheduler.autoConnect();
++      }
++    });
++  } catch (e) {
++    warn`starting Sync: ${e}`;
++  }
++}
++
++function state() {
++  const s = lazy.UIState.get();
++  return {
++    status: s.status,
++    email: s.email ?? null,
++    displayName: s.displayName ?? null,
++    syncing: !!s.syncing,
++    lastSync: s.lastSync ? s.lastSync.getTime() : 0,
++  };
++}
++
++export const LegacyFoxSync = {
++  async onEvent(aEvent, aData, aCallback) {
++    debug`onEvent ${aEvent}`;
++    try {
++      startSync();
++      switch (aEvent) {
++        case "LegacyFox:Sync:State":
++          await lazy.UIState.refresh();
++          aCallback.onSuccess(state());
++          break;
++        case "LegacyFox:Sync:SignInURL":
++          aCallback.onSuccess(
++            await lazy.FxAccountsConfig.promiseConnectAccountURI("legacyfox")
++          );
++          break;
++        case "LegacyFox:Sync:SyncNow":
++          lazy.Weave.Service.sync({ why: "user" });
++          aCallback.onSuccess(true);
++          break;
++        case "LegacyFox:Sync:SignOut":
++          await lazy.getFxAccountsSingleton().signOut();
++          aCallback.onSuccess(true);
++          break;
++      }
++    } catch (e) {
++      warn`${aEvent}: ${e}`;
++      aCallback.onError(String(e));
++    }
++  },
++};
+diff --git a/mobile/shared/modules/geckoview/moz.build b/mobile/shared/modules/geckoview/moz.build
+index ccf93e66c1..3e9776a788 100644
+--- a/mobile/shared/modules/geckoview/moz.build
++++ b/mobile/shared/modules/geckoview/moz.build
+@@ -37,7 +37,10 @@ EXTRA_JS_MODULES += [
+     "GeckoViewTranslations.sys.mjs",
+     "GeckoViewUtils.sys.mjs",
+     "GeckoViewWebExtension.sys.mjs",
++    "LegacyFoxDownloads.sys.mjs",
+     "LegacyFoxLogins.sys.mjs",
++    "LegacyFoxPlaces.sys.mjs",
++    "LegacyFoxSync.sys.mjs",
+     "LoadURIDelegate.sys.mjs",
+     "MediaUtils.sys.mjs",
+     "Messaging.sys.mjs",
+diff --git a/uriloader/exthandler/uikit/nsOSHelperAppService.mm b/uriloader/exthandler/uikit/nsOSHelperAppService.mm
+index 552dd81e84..df612a722d 100644
+--- a/uriloader/exthandler/uikit/nsOSHelperAppService.mm
++++ b/uriloader/exthandler/uikit/nsOSHelperAppService.mm
+@@ -3,6 +3,7 @@
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "nsOSHelperAppService.h"
++#include "nsMIMEInfoUIKit.h"
+ 
+ nsOSHelperAppService::nsOSHelperAppService() : nsExternalHelperAppService() {}
+ 
+@@ -44,7 +45,21 @@ NS_IMETHODIMP nsOSHelperAppService::GetMIMEInfoFromOS(
+     nsIMIMEInfo** aMIMEInfo) {
+   *aMIMEInfo = nullptr;
+   *aFound = false;
++#ifdef MOZ_IOS_LEGACY
++  // No system handlers here: a plain MIME info that saves to disk, so that
++  // downloads go through Gecko's own helper app service.
++  RefPtr<nsMIMEInfoUIKit> info = new nsMIMEInfoUIKit(
++      aMIMEType.IsEmpty() ? "application/octet-stream"_ns : aMIMEType);
++  if (!aFileExt.IsEmpty()) {
++    info->AppendExtension(aFileExt);
++  }
++  info->SetPreferredAction(nsIMIMEInfo::saveToDisk);
++  info->SetAlwaysAskBeforeHandling(false);
++  info.forget(aMIMEInfo);
++  return NS_OK;
++#else
+   return NS_ERROR_NOT_IMPLEMENTED;
++#endif
+ }
+ 
+ NS_IMETHODIMP
+-- 
+2.53.0
+

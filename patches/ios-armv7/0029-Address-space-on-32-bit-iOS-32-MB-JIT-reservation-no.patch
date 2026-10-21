@@ -1,0 +1,184 @@
+From 8958235b12d91e4fb915639fc6a22b864a8308e2 Mon Sep 17 00:00:00 2001
+From: LR-Vensuki <260785366+LR-Vensuki@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 14:09:49 +0300
+Subject: [PATCH 29/42] Address space on 32-bit iOS: 32 MB JIT reservation, no
+ font-file sweeps
+
+A 32-bit iOS app gets about 750 MB of address space and XUL maps 120 MB
+of it. The JIT reserved 140 MB up front; WebRender and CoreText fallback
+asked for Lucida Grande, which iOS lacks, so CoreText opened every font
+file looking for it; the font info loader and the exhaustive fallback
+search did the same. CJK fallback fonts are now tried only for CJK text.
+---
+ gfx/thebes/CoreTextFontList.cpp               | 11 ++++++++++
+ gfx/thebes/gfxPlatformFontList.cpp            |  9 +++++++++
+ gfx/thebes/gfxPlatformMac.cpp                 | 20 ++++++++++++-------
+ gfx/webrender_bindings/src/moz2d_renderer.rs  |  8 ++++++--
+ .../src/platform/macos/font.rs                | 11 ++++++++--
+ js/src/jit/ProcessExecutableMemory.h          |  6 +++++-
+ 6 files changed, 53 insertions(+), 12 deletions(-)
+
+diff --git a/gfx/thebes/CoreTextFontList.cpp b/gfx/thebes/CoreTextFontList.cpp
+index 2c3edf3895..bbd955d9fc 100644
+--- a/gfx/thebes/CoreTextFontList.cpp
++++ b/gfx/thebes/CoreTextFontList.cpp
+@@ -1350,7 +1350,12 @@ gfxFontEntry* CoreTextFontList::PlatformGlobalFontFallback(
+   bool cantUseFallbackFont = false;
+ 
+   if (!mDefaultFont) {
++#ifdef MOZ_IOS_LEGACY
++    // iOS has no Lucida Grande.
++    mDefaultFont = CTFontCreateWithName(CFSTR("Helvetica"), 12.f, nullptr);
++#else
+     mDefaultFont = CTFontCreateWithName(CFSTR("LucidaGrande"), 12.f, nullptr);
++#endif
+   }
+ 
+   AutoCFTypeRef<CTFontRef> fallback(
+@@ -1690,6 +1695,12 @@ void CTFontInfo::LoadFontFamilyData(const nsACString& aFamilyName) {
+ }
+ 
+ already_AddRefed<FontInfoData> CoreTextFontList::CreateFontInfoData() {
++#ifdef MOZ_IOS_LEGACY
++  // The background loader opens every font file for localized family names,
++  // mapping all of them (100+ MB of CJK fonts) into the ~750 MB address
++  // space of a 32-bit iOS app. Families are found by their English names.
++  return nullptr;
++#endif
+   bool loadCmaps = !UsesSystemFallback() ||
+                    gfxPlatform::GetPlatform()->UseCmapsDuringSystemFallback();
+ 
+diff --git a/gfx/thebes/gfxPlatformFontList.cpp b/gfx/thebes/gfxPlatformFontList.cpp
+index 3cc19fd89e..4288b9ec9e 100644
+--- a/gfx/thebes/gfxPlatformFontList.cpp
++++ b/gfx/thebes/gfxPlatformFontList.cpp
+@@ -1471,6 +1471,15 @@ already_AddRefed<gfxFont> gfxPlatformFontList::GlobalFontFallback(
+     }
+   }
+ 
++#ifdef MOZ_IOS_LEGACY
++  // Searching every font maps every font file: on iOS 4-7 that is over
++  // 100 MB of the ~750 MB address space an app gets (and CoreText then fails
++  // allocations and crashes). CoreText's own fallback above is the answer.
++  if (!useCmaps) {
++    return nullptr;
++  }
++#endif
++
+   // otherwise, try to find it among local fonts
+   GlobalFontMatch data(aCh, aNextCh, *aMatchStyle, aPresentation);
+   if (SharedFontList()) {
+diff --git a/gfx/thebes/gfxPlatformMac.cpp b/gfx/thebes/gfxPlatformMac.cpp
+index 9820fc3627..4152e1f334 100644
+--- a/gfx/thebes/gfxPlatformMac.cpp
++++ b/gfx/thebes/gfxPlatformMac.cpp
+@@ -687,21 +687,27 @@ void gfxPlatformMac::GetCommonFallbackFonts(uint32_t aCh, Script aRunScript,
+     aFontList.AppendElement("Geneva");
+     aFontList.AppendElement("STIXGeneral");
+     aFontList.AppendElement("Apple Symbols");
++#ifndef MOZ_IOS_LEGACY
+     // Japanese fonts also cover a lot of miscellaneous symbols
+     aFontList.AppendElement("Hiragino Sans");
+     aFontList.AppendElement("Hiragino Kaku Gothic ProN");
++#endif
+   }
+ 
+ #ifdef MOZ_IOS_LEGACY
+   // iOS 4-7 has none of the macOS fonts named above for CJK and Latin; these
+-  // are the ones it ships.
++  // are the ones it ships. CJK fonts only for CJK text and punctuation: each
++  // one tried maps 10-28 MB of font file into the app's address space.
+   aFontList.AppendElement("Helvetica");
+-  aFontList.AppendElement("Heiti SC");
+-  aFontList.AppendElement("Heiti TC");
+-  aFontList.AppendElement("Hiragino Kaku Gothic ProN");
+-  aFontList.AppendElement("Apple SD Gothic Neo");
+-  aFontList.AppendElement("Heiti J");
+-  aFontList.AppendElement("Heiti K");
++  if ((b >= 0x2e && b <= 0x9f) || (b >= 0xac && b <= 0xd7) ||
++      (b >= 0xf9 && b <= 0xff) || aCh >= 0x20000) {
++    aFontList.AppendElement("Heiti SC");
++    aFontList.AppendElement("Heiti TC");
++    aFontList.AppendElement("Hiragino Kaku Gothic ProN");
++    aFontList.AppendElement("Apple SD Gothic Neo");
++    aFontList.AppendElement("Heiti J");
++    aFontList.AppendElement("Heiti K");
++  }
+ #endif
+ 
+   // Arial Unicode MS has lots of glyphs for obscure characters; try it as a
+diff --git a/gfx/webrender_bindings/src/moz2d_renderer.rs b/gfx/webrender_bindings/src/moz2d_renderer.rs
+index c885ba051e..a831e0e5f8 100644
+--- a/gfx/webrender_bindings/src/moz2d_renderer.rs
++++ b/gfx/webrender_bindings/src/moz2d_renderer.rs
+@@ -849,8 +849,12 @@ impl Moz2dBlobImageHandler {
+                     // It is preferable to use a fallback font instead so that rendering
+                     // can at least still proceed in some fashion without erroring.
+                     // Lucida Grande is the fallback font in Gecko, so use that here.
+-                    CGFont::from_name(&CFString::from_static_string("Lucida Grande"))
+-                        .expect("Failed reading font descriptor and could not load fallback font")
++                    CGFont::from_name(&CFString::from_static_string(if cfg!(target_os = "ios") {
++                        "Helvetica" // no Lucida Grande on iOS
++                    } else {
++                        "Lucida Grande"
++                    }))
++                    .expect("Failed reading font descriptor and could not load fallback font")
+                 },
+             };
+             unsafe { AddNativeFontHandle(key, font.as_ptr() as *mut c_void, 0) };
+diff --git a/gfx/wr/wr_glyph_rasterizer/src/platform/macos/font.rs b/gfx/wr/wr_glyph_rasterizer/src/platform/macos/font.rs
+index ffe999d6b4..75ab253fde 100644
+--- a/gfx/wr/wr_glyph_rasterizer/src/platform/macos/font.rs
++++ b/gfx/wr/wr_glyph_rasterizer/src/platform/macos/font.rs
+@@ -73,6 +73,13 @@ struct GlyphMetrics {
+ // We can discern between cases 2 and 3 by rendering with and without smoothing
+ // and comparing the two to determine if there was some dilation.
+ // This returns the actual FontRenderMode needed to support each case, if any.
++// iOS has no Lucida Grande, and looking up a missing name makes CoreText
++// open every installed font (on 32-bit iOS, 100+ MB of address space).
++#[cfg(not(target_os = "ios"))]
++pub const FALLBACK_FONT_NAME: &str = "Lucida Grande";
++#[cfg(target_os = "ios")]
++pub const FALLBACK_FONT_NAME: &str = "Helvetica";
++
+ fn determine_font_smoothing_mode() -> Option<FontRenderMode> {
+     let mut smooth_context = CGContext::create_bitmap_context(
+         None,
+@@ -102,7 +109,7 @@ fn determine_font_smoothing_mode() -> Option<FontRenderMode> {
+     // Autorelease pool for CTFont
+     objc::rc::autoreleasepool(|| {
+         // Lucida Grande 12 is the default fallback font in Firefox
+-        let ct_font = core_text::font::new_from_name("Lucida Grande", 12.).unwrap();
++        let ct_font = core_text::font::new_from_name(FALLBACK_FONT_NAME, 12.).unwrap();
+         let point = CGPoint { x: 0., y: 0. };
+         let glyph = 'X' as CGGlyph;
+         ct_font.draw_glyphs(&[glyph], &[point], smooth_context.clone());
+@@ -287,7 +294,7 @@ impl FontContext {
+                     // It is preferable to use a fallback font instead so that rendering
+                     // can at least still proceed in some fashion without erroring.
+                     // Lucida Grande is the fallback font in Gecko, so use that here.
+-                    CGFont::from_name(&CFString::from_static_string("Lucida Grande"))
++                    CGFont::from_name(&CFString::from_static_string(FALLBACK_FONT_NAME))
+                         .expect("couldn't find font with postscript name and couldn't load fallback font")
+                 }
+             };
+diff --git a/js/src/jit/ProcessExecutableMemory.h b/js/src/jit/ProcessExecutableMemory.h
+index 5e3b4e010b..4097f2339a 100644
+--- a/js/src/jit/ProcessExecutableMemory.h
++++ b/js/src/jit/ProcessExecutableMemory.h
+@@ -18,7 +18,11 @@ namespace jit {
+ 
+ // Limit on the number of bytes of executable memory to prevent JIT spraying
+ // attacks.
+-#if JS_BITS_PER_WORD == 32
++#if defined(MOZ_IOS_LEGACY)
++// 32-bit iOS apps get about 750 MB of address space, and XUL alone maps
++// 120 MB of it; the reservation is all of this, used or not.
++static const size_t MaxCodeBytesPerProcess = 32 * 1024 * 1024;
++#elif JS_BITS_PER_WORD == 32
+ static const size_t MaxCodeBytesPerProcess = 140 * 1024 * 1024;
+ #else
+ // This is the largest number which satisfies various alignment static
+-- 
+2.53.0
+

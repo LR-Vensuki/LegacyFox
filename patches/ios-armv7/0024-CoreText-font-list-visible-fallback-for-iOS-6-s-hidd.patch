@@ -1,0 +1,76 @@
+From b430db189aeaa4a183f1aa7923969733f6cd6362 Mon Sep 17 00:00:00 2001
+From: LR-Vensuki <260785366+LR-Vensuki@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 00:13:06 +0300
+Subject: [PATCH 24/42] CoreText font list: visible fallback for iOS 6's hidden
+ UI font family
+
+---
+ gfx/thebes/CoreTextFontList.cpp                | 18 ++++++++++++++++++
+ .../rust/atomic_refcell/.cargo-checksum.json   |  2 +-
+ third_party/rust/atomic_refcell/src/lib.rs     |  4 ++--
+ 3 files changed, 21 insertions(+), 3 deletions(-)
+
+diff --git a/gfx/thebes/CoreTextFontList.cpp b/gfx/thebes/CoreTextFontList.cpp
+index 98454ae471..2c3edf3895 100644
+--- a/gfx/thebes/CoreTextFontList.cpp
++++ b/gfx/thebes/CoreTextFontList.cpp
+@@ -1925,7 +1925,25 @@ FontFamily CoreTextFontList::GetDefaultFontForPlatform(
+   nsAutoString familyName;
+   GetStringForCFString(name, familyName);
+ 
++#if defined(MOZ_IOS_LEGACY)
++  // The iOS 4-7 UI font is a hidden family (".Helvetica NeueUI") that the
++  // font list does not show; fall back to the faces it is drawn from.
++  if (FontFamily family = FindFamily(aFontVisibilityProvider,
++                                     NS_ConvertUTF16toUTF8(familyName));
++      !family.IsNull()) {
++    return family;
++  }
++  for (const char* fallback : {"Helvetica Neue", "Helvetica", "Arial"}) {
++    if (FontFamily family =
++            FindFamily(aFontVisibilityProvider, nsDependentCString(fallback));
++        !family.IsNull()) {
++      return family;
++    }
++  }
++  return FontFamily();
++#else
+   return FindFamily(aFontVisibilityProvider, NS_ConvertUTF16toUTF8(familyName));
++#endif
+ }
+ 
+ #ifdef MOZ_BUNDLED_FONTS
+diff --git a/third_party/rust/atomic_refcell/.cargo-checksum.json b/third_party/rust/atomic_refcell/.cargo-checksum.json
+index 09f9c2057a..a64d7b2391 100644
+--- a/third_party/rust/atomic_refcell/.cargo-checksum.json
++++ b/third_party/rust/atomic_refcell/.cargo-checksum.json
+@@ -1 +1 @@
+-{"files":{".cargo_vcs_info.json":"6f70387c3756637b099576ebe1cc430dd547e40d1a14b0897ce6cfa834b4d6ee","Cargo.toml":"dd91a57271a7ab33c6c4d7c76e010f9e5ff68414690c40a1918fb57818cb0768","Cargo.toml.orig":"3e2a71b4a7f7564bc396b5e2a956d51e30b55d683fce62d45928573a96910447","LICENSE.APACHE":"c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4","LICENSE.MIT":"d8e997e6cdf64acfdd3a9315b5dea0dd933f1f5386a55a2c16916dc8514071f2","README.md":"6b468f17809063c5dcee5758d1daca147d74e2297a9dc78a5e50ae13d9ea6e42","benches/basic.rs":"aba00ab044b37a7fb4e5c855cf88a323a04d6143b651717e227fdd12735602f3","src/lib.rs":"d65e83920e9f56de931331cb64588c9511e76466fc6d5dd2872d701dcb8b7e9c","tests/basic.rs":"2cefa20188254d8357a595975733ad1bffb4de90933d5d9e9caa17232c1d646b"},"package":"857253367827bd9d0fd973f0ef15506a96e79e41b0ad7aa691203a4e3214f6c8"}
+\ No newline at end of file
++{"files":{".cargo_vcs_info.json":"6f70387c3756637b099576ebe1cc430dd547e40d1a14b0897ce6cfa834b4d6ee","Cargo.toml":"dd91a57271a7ab33c6c4d7c76e010f9e5ff68414690c40a1918fb57818cb0768","Cargo.toml.orig":"3e2a71b4a7f7564bc396b5e2a956d51e30b55d683fce62d45928573a96910447","LICENSE.APACHE":"c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4","LICENSE.MIT":"d8e997e6cdf64acfdd3a9315b5dea0dd933f1f5386a55a2c16916dc8514071f2","README.md":"6b468f17809063c5dcee5758d1daca147d74e2297a9dc78a5e50ae13d9ea6e42","benches/basic.rs":"aba00ab044b37a7fb4e5c855cf88a323a04d6143b651717e227fdd12735602f3","tests/basic.rs":"2cefa20188254d8357a595975733ad1bffb4de90933d5d9e9caa17232c1d646b"},"package":"857253367827bd9d0fd973f0ef15506a96e79e41b0ad7aa691203a4e3214f6c8"}
+\ No newline at end of file
+diff --git a/third_party/rust/atomic_refcell/src/lib.rs b/third_party/rust/atomic_refcell/src/lib.rs
+index b1afc324e7..092bdd7c90 100644
+--- a/third_party/rust/atomic_refcell/src/lib.rs
++++ b/third_party/rust/atomic_refcell/src/lib.rs
+@@ -119,7 +119,7 @@ impl<T: ?Sized> AtomicRefCell<T> {
+                 value: unsafe { &*self.value.get() },
+                 borrow,
+             },
+-            Err(s) => panic!("{}", s),
++            Err(s) => panic!("{} (state {:#x} at {:p})", s, self.borrow.load(atomic::Ordering::Relaxed), &self.borrow),
+         }
+     }
+ 
+@@ -144,7 +144,7 @@ impl<T: ?Sized> AtomicRefCell<T> {
+                 value: unsafe { &mut *self.value.get() },
+                 borrow,
+             },
+-            Err(s) => panic!("{}", s),
++            Err(s) => panic!("{} (state {:#x} at {:p})", s, self.borrow.load(atomic::Ordering::Relaxed), &self.borrow),
+         }
+     }
+ 
+-- 
+2.53.0
+

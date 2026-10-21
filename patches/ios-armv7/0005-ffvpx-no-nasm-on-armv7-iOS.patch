@@ -1,0 +1,26 @@
+From fe729049ca56f93e932a7daea0705e33dd33f2a3 Mon Sep 17 00:00:00 2001
+From: LR-Vensuki <260785366+LR-Vensuki@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 00:44:32 +0300
+Subject: [PATCH 05/42] ffvpx: no nasm on armv7 iOS
+
+---
+ toolkit/moz.configure | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/toolkit/moz.configure b/toolkit/moz.configure
+index 593f8b9b9c..9c9b280a0e 100644
+--- a/toolkit/moz.configure
++++ b/toolkit/moz.configure
+@@ -2580,7 +2580,8 @@ def ffvpx(target):
+                 "-D__x86_64__",
+                 "-Pconfig_darwin64.asm",
+             ]
+-        elif target.cpu == "aarch64":
++        elif target.cpu in ("aarch64", "arm"):
++            # armv7 iOS (LegacyFox): the C and NEON paths, like Android arm
+             use_nasm = False
+     elif target.os == "Android":
+         if target.cpu == "x86_64":
+-- 
+2.53.0
+

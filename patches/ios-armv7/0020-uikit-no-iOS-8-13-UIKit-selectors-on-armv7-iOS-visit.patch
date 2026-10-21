@@ -1,0 +1,46 @@
+From 1055e3a05dcd330a1c2775122dff3e26d5084aa0 Mon Sep 17 00:00:00 2001
+From: LR-Vensuki <260785366+LR-Vensuki@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 00:20:34 +0300
+Subject: [PATCH 20/42] uikit: no iOS 8/13 UIKit selectors on armv7 iOS
+ (visited link color, accessibilityElements)
+
+---
+ widget/uikit/nsLookAndFeel.mm | 4 ++++
+ widget/uikit/nsWindow.mm      | 4 ++++
+ 2 files changed, 8 insertions(+)
+
+diff --git a/widget/uikit/nsLookAndFeel.mm b/widget/uikit/nsLookAndFeel.mm
+index e5198c6f3f..be1e0c2f2e 100644
+--- a/widget/uikit/nsLookAndFeel.mm
++++ b/widget/uikit/nsLookAndFeel.mm
+@@ -192,7 +192,11 @@ nsresult nsLookAndFeel::NativeGetColor(ColorID aID, ColorScheme aColorScheme,
+     case ColorID::Visitedtext:
+       // Safari defaults to the MacOS color implementation for visited links,
+       // which in turn uses systemPurpleColor, so we do the same here.
++#if defined(MOZ_IOS_LEGACY)
++      aResult = NS_RGB(0x55, 0x1a, 0x8b);  // systemPurpleColor is iOS 13; 2012's visited purple
++#else
+       aResult = GetColorFromUIColor([UIColor systemPurpleColor]);
++#endif
+       break;
+     case ColorID::Linktext:
+     case ColorID::Activetext:
+diff --git a/widget/uikit/nsWindow.mm b/widget/uikit/nsWindow.mm
+index 07e1f5a0e6..8689429105 100644
+--- a/widget/uikit/nsWindow.mm
++++ b/widget/uikit/nsWindow.mm
+@@ -728,7 +728,11 @@ class nsAutoRetainUIKitObject {
+ 
+ - (NSArray* _Nullable)accessibilityElements {
+   if (!mozilla::a11y::ShouldA11yBeEnabled()) {
++#  if defined(MOZ_IOS_LEGACY)
++    return nil;  // UIView's accessibilityElements is iOS 8
++#  else
+     return [super accessibilityElements];
++#  endif
+   }
+ 
+   return [[self accessible] accessibilityElements];
+-- 
+2.53.0
+

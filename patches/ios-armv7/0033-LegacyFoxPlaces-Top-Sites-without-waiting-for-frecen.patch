@@ -1,0 +1,30 @@
+From 0caaed418ebcee17cf4f881a1d6785efd2670235 Mon Sep 17 00:00:00 2001
+From: LR-Vensuki <260785366+LR-Vensuki@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 18:48:36 +0300
+Subject: [PATCH 33/42] LegacyFoxPlaces: Top Sites without waiting for frecency
+ recalculation
+
+---
+ mobile/shared/modules/geckoview/LegacyFoxPlaces.sys.mjs | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/mobile/shared/modules/geckoview/LegacyFoxPlaces.sys.mjs b/mobile/shared/modules/geckoview/LegacyFoxPlaces.sys.mjs
+index 2b7cc999af..703fb609b4 100644
+--- a/mobile/shared/modules/geckoview/LegacyFoxPlaces.sys.mjs
++++ b/mobile/shared/modules/geckoview/LegacyFoxPlaces.sys.mjs
+@@ -57,8 +57,10 @@ export const LegacyFoxPlaces = {
+           aCallback.onSuccess(
+             await query(
+               `SELECT ${SITE_COLUMNS} FROM moz_places h
+-               WHERE ${READABLE} AND h.frecency > 0 AND instr(h.url, 'q=') = 0
+-               ORDER BY h.frecency DESC LIMIT :limit`,
++               WHERE ${READABLE} AND h.visit_count > 0
++                 AND instr(h.url, '?q=') + instr(h.url, '&q=') + instr(h.url, 'text=') = 0
++               ORDER BY h.frecency DESC, h.visit_count DESC, h.last_visit_date DESC
++               LIMIT :limit`,
+               { limit }
+             )
+           );
+-- 
+2.53.0
+

@@ -1,0 +1,54 @@
+From 630b1d5fd3435cd6ee684f79c77dd533b8fe1aaa Mon Sep 17 00:00:00 2001
+From: LR-Vensuki <260785366+LR-Vensuki@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 18:51:27 +0300
+Subject: [PATCH 34/42] LegacyFoxDownloads: save a given address (images from
+ the long-press menu)
+
+---
+ .../geckoview/GeckoViewStartup.sys.mjs          |  1 +
+ .../geckoview/LegacyFoxDownloads.sys.mjs        | 17 +++++++++++++++++
+ 2 files changed, 18 insertions(+)
+
+diff --git a/mobile/shared/components/geckoview/GeckoViewStartup.sys.mjs b/mobile/shared/components/geckoview/GeckoViewStartup.sys.mjs
+index 9f6c333254..53116943b3 100644
+--- a/mobile/shared/components/geckoview/GeckoViewStartup.sys.mjs
++++ b/mobile/shared/components/geckoview/GeckoViewStartup.sys.mjs
+@@ -131,6 +131,7 @@ export class GeckoViewStartup {
+             module: "resource://gre/modules/LegacyFoxDownloads.sys.mjs",
+             ged: [
+               "LegacyFox:Downloads:List",
++              "LegacyFox:Downloads:Save",
+               "LegacyFox:Downloads:Cancel",
+               "LegacyFox:Downloads:Retry",
+               "LegacyFox:Downloads:Remove",
+diff --git a/mobile/shared/modules/geckoview/LegacyFoxDownloads.sys.mjs b/mobile/shared/modules/geckoview/LegacyFoxDownloads.sys.mjs
+index a56dafcb6d..6a7fd58e3a 100644
+--- a/mobile/shared/modules/geckoview/LegacyFoxDownloads.sys.mjs
++++ b/mobile/shared/modules/geckoview/LegacyFoxDownloads.sys.mjs
+@@ -77,6 +77,23 @@ export const LegacyFoxDownloads = {
+           aCallback.onSuccess(all);
+           break;
+         }
++        case "LegacyFox:Downloads:Save": {
++          // "Save image" and the like: a download of a given address.
++          const dir = Services.prefs.getStringPref("browser.download.dir");
++          let name = decodeURIComponent(
++            new URL(aData.url).pathname.split("/").pop() || "download"
++          ).replace(/[\/:*?"<>|]/g, "_");
++          const path = await IOUtils.createUniqueFile(dir, name);
++          const d = await lazy.Downloads.createDownload({
++            source: aData.url,
++            target: path,
++          });
++          const list = await lazy.Downloads.getList(lazy.Downloads.PUBLIC);
++          await list.add(d);
++          d.start().catch(e => warn`saving ${aData.url}: ${e}`);
++          aCallback.onSuccess(path);
++          break;
++        }
+         case "LegacyFox:Downloads:Cancel": {
+           const d = await find(aData.id);
+           await d?.finalize(true);
+-- 
+2.53.0
+

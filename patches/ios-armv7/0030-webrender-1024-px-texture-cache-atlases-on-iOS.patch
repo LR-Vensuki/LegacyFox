@@ -1,0 +1,36 @@
+From f9bbb01179afbea54ce582bcf6f9c125b9ee5278 Mon Sep 17 00:00:00 2001
+From: LR-Vensuki <260785366+LR-Vensuki@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 14:17:35 +0300
+Subject: [PATCH 30/42] webrender: 1024 px texture-cache atlases on iOS
+
+---
+ gfx/webrender_bindings/src/bindings.rs | 13 ++++++++++++-
+ 1 file changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/gfx/webrender_bindings/src/bindings.rs b/gfx/webrender_bindings/src/bindings.rs
+index a89cc039ea..864c857522 100644
+--- a/gfx/webrender_bindings/src/bindings.rs
++++ b/gfx/webrender_bindings/src/bindings.rs
+@@ -2089,7 +2089,18 @@ pub extern "C" fn wr_window_new(
+         None
+     };
+ 
+-    let texture_cache_config = if is_main_window {
++    let texture_cache_config = if is_main_window && cfg!(target_os = "ios") {
++        // 32-bit iOS: a 2048 x 2048 atlas is 16 MB of memory and of the
++        // ~750 MB address space; atlases are added as more are needed.
++        TextureCacheConfig {
++            color8_linear_texture_size: 1024,
++            color8_nearest_texture_size: 512,
++            color8_glyph_texture_size: 1024,
++            alpha8_texture_size: 512,
++            alpha8_glyph_texture_size: 1024,
++            alpha16_texture_size: 512,
++        }
++    } else if is_main_window {
+         TextureCacheConfig::DEFAULT
+     } else {
+         TextureCacheConfig {
+-- 
+2.53.0
+

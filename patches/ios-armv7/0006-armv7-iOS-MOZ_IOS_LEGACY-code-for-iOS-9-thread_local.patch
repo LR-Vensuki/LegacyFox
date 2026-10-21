@@ -1,0 +1,221 @@
+From 853f17ce73373de9e3ec9fe996649c17d88745c4 Mon Sep 17 00:00:00 2001
+From: LR-Vensuki <260785366+LR-Vensuki@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 01:01:31 +0300
+Subject: [PATCH 06/42] armv7 iOS: MOZ_IOS_LEGACY; code for iOS 9
+ (thread_local), no GNU/ELF assembly in pixman/libvpx/opus/ffvpx, no ARMv8
+ crypto in NSS, no llama.cpp
+
+---
+ build/moz.configure/init.configure             | 13 +++++++++++++
+ build/moz.configure/toolchain.configure        |  8 +++++++-
+ dom/webidl/moz.build                           |  2 +-
+ gfx/cairo/libpixman/src/moz.build              |  3 ++-
+ media/ffvpx/config.h                           |  3 +++
+ media/libopus/moz.build                        |  4 ++--
+ media/libvpx/moz.build                         |  4 +++-
+ security/moz.build                             |  6 ++++++
+ toolkit/components/ml/backends/llama/moz.build |  2 +-
+ toolkit/components/ml/moz.build                |  2 +-
+ toolkit/moz.configure                          | 15 ++++++++++++---
+ 11 files changed, 51 insertions(+), 11 deletions(-)
+
+diff --git a/build/moz.configure/init.configure b/build/moz.configure/init.configure
+index 833904ff91..413cb164fe 100644
+--- a/build/moz.configure/init.configure
++++ b/build/moz.configure/init.configure
+@@ -900,6 +900,19 @@ def target_is_ios(target):
+ set_define("XP_IOS", target_is_ios)
+ 
+ 
++# LegacyFox: iOS 4-7 on armv7, built against the iOS 6.1 SDK. Everything the
++# iOS port takes from iOS 17 (BrowserEngineKit, ExtensionKit, XPC, IOSurface,
++# VideoToolbox, Swift) is left out where this is set.
++@depends(target)
++def target_is_ios_legacy(target):
++    if target.os == "iOS" and target.cpu == "arm":
++        return True
++
++
++set_config("MOZ_IOS_LEGACY", target_is_ios_legacy)
++set_define("MOZ_IOS_LEGACY", target_is_ios_legacy)
++
++
+ @depends(target)
+ def target_has_linux_kernel(target):
+     if target.kernel == "Linux":
+diff --git a/build/moz.configure/toolchain.configure b/build/moz.configure/toolchain.configure
+index 9148e9bf9e..4f8642f5ff 100644
+--- a/build/moz.configure/toolchain.configure
++++ b/build/moz.configure/toolchain.configure
+@@ -1374,7 +1374,13 @@ def compiler(
+         if host_or_target.os == "OSX" and macos_target:
+             flags.append("-mmacosx-version-min=%s" % macos_target)
+         if host_or_target.os == "iOS" and ios_target:
+-            flags.append("-mios-version-min=%s" % ios_target)
++            # LegacyFox: clang allows thread_local on armv7 only from iOS 9,
++            # so code is generated for 9 there (with -femulated-tls, which
++            # works on any iOS) and the iOS 4+ minimum is set at link time.
++            if host_or_target.cpu == "arm" and Version(ios_target) < Version("9.0"):
++                flags.append("-mios-version-min=9.0")
++            else:
++                flags.append("-mios-version-min=%s" % ios_target)
+ 
+         # When not given an explicit compatibility version, clang-cl tries
+         # to get one from MSVC, which might not even be the one used by the
+diff --git a/dom/webidl/moz.build b/dom/webidl/moz.build
+index 35be78b5ef..8ffbcb0202 100644
+--- a/dom/webidl/moz.build
++++ b/dom/webidl/moz.build
+@@ -1146,7 +1146,7 @@ WEBIDL_FILES = [
+ ]
+ 
+ # Native llama.cpp for ml engine.
+-if CONFIG["MOZ_WIDGET_TOOLKIT"] != "android":
++if CONFIG["MOZ_WIDGET_TOOLKIT"] != "android" and not CONFIG["MOZ_IOS_LEGACY"]:
+     WEBIDL_FILES += [
+         "LlamaRunner.webidl",
+     ]
+diff --git a/gfx/cairo/libpixman/src/moz.build b/gfx/cairo/libpixman/src/moz.build
+index d575d8f123..e8421f5b6c 100644
+--- a/gfx/cairo/libpixman/src/moz.build
++++ b/gfx/cairo/libpixman/src/moz.build
+@@ -77,7 +77,8 @@ elif CONFIG['TARGET_CPU'] == 'aarch64' and CONFIG['OS_TARGET'] in ('Android', 'L
+         'pixman-arma64-neon-asm.S',
+     ]
+     SOURCES['pixman-arm-neon.c'].flags += ['-march=armv8-a']
+-elif CONFIG['TARGET_CPU'] == 'arm':
++# LegacyFox: pixman's ARM assembly is GNU/ELF only; armv7 iOS takes the C paths.
++elif CONFIG['TARGET_CPU'] == 'arm' and not CONFIG['MOZ_IOS_LEGACY']:
+     if CONFIG['HAVE_ARM_NEON']:
+         DEFINES['USE_ARM_NEON'] = True
+         SOURCES += [
+diff --git a/media/ffvpx/config.h b/media/ffvpx/config.h
+index baf1fa959a..c32e9bc8da 100644
+--- a/media/ffvpx/config.h
++++ b/media/ffvpx/config.h
+@@ -46,6 +46,9 @@
+ #  elif defined(XP_DARWIN)
+ #    if defined(__aarch64__)
+ #      include "config_darwin_aarch64.h"
++#    elif defined(__arm__)
++// LegacyFox, armv7 iOS: no assembly (ffmpeg's arm asm is GNU/ELF only)
++#      include "config_generic.h"
+ #    else
+ #      include "config_darwin64.h"
+ #    endif
+diff --git a/media/libopus/moz.build b/media/libopus/moz.build
+index 3157236b2b..4ff85dceb9 100644
+--- a/media/libopus/moz.build
++++ b/media/libopus/moz.build
+@@ -26,7 +26,7 @@ DEFINES["ENABLE_HARDENING"] = True
+ # Don"t export symbols
+ DEFINES["OPUS_EXPORT"] = ""
+ 
+-if CONFIG["TARGET_CPU"] == "arm" and CONFIG["GNU_AS"]:
++if CONFIG["TARGET_CPU"] == "arm" and CONFIG["GNU_AS"] and not CONFIG["MOZ_IOS_LEGACY"]:
+     DEFINES["OPUS_ARM_ASM"] = True
+     DEFINES["OPUS_ARM_EXTERNAL_ASM"] = True
+     DEFINES["OPUS_ARM_INLINE_ASM"] = True
+@@ -110,7 +110,7 @@ if CONFIG["TARGET_CPU"] in ("x86", "x86_64"):
+            f in silk_sources_fixed_sse4_1:
+             SOURCES[f].flags += ["-msse4.1"]
+ 
+-if CONFIG["TARGET_CPU"] == "arm" and CONFIG["GNU_AS"]:
++if CONFIG["TARGET_CPU"] == "arm" and CONFIG["GNU_AS"] and not CONFIG["MOZ_IOS_LEGACY"]:
+     GeneratedFile(
+             "celt_pitch_xcorr_arm-gnu.s",
+             script="arm2gnu.py",
+diff --git a/media/libvpx/moz.build b/media/libvpx/moz.build
+index 76685b5fcc..37b1a1bcf3 100644
+--- a/media/libvpx/moz.build
++++ b/media/libvpx/moz.build
+@@ -43,7 +43,9 @@ elif CONFIG['TARGET_CPU'] == 'x86':
+         SOURCES += files['LINUX_IA32_SOURCES']
+         ASFLAGS += [ '-I%s/media/libvpx/config/linux/ia32/' % TOPSRCDIR ]
+         LOCAL_INCLUDES += [ '/media/libvpx/config/linux/ia32/' ]
+-elif CONFIG['TARGET_CPU'] == 'arm':
++# LegacyFox: libvpx's arm assembly is GNU/ELF only; armv7 iOS takes the
++# generic C configuration below.
++elif CONFIG['TARGET_CPU'] == 'arm' and not CONFIG['MOZ_IOS_LEGACY']:
+     EXPORTS.vpx += files['LINUX_ARM_EXPORTS']
+     ASFLAGS += [
+         '-I%s/media/libvpx/config/linux/arm/' % TOPSRCDIR,
+diff --git a/security/moz.build b/security/moz.build
+index 90bae217e5..e9a2497537 100644
+--- a/security/moz.build
++++ b/security/moz.build
+@@ -121,6 +121,12 @@ gyp_vars["iphone_deployment_target"] = "doesntmatter"
+ # it.
+ gyp_vars["use_pkcs5_pbkd2_params2_only"] = 1
+ 
++# LegacyFox: A4-A6 are ARMv7 without the ARMv8 crypto extensions.
++if CONFIG["MOZ_IOS_LEGACY"]:
++    gyp_vars["disable_arm_hw_aes"] = 1
++    gyp_vars["disable_arm_hw_sha1"] = 1
++    gyp_vars["disable_arm_hw_sha2"] = 1
++
+ # Clang can build NSS with its integrated assembler since version 9.
+ if (
+     CONFIG["TARGET_CPU"] == "x86_64"
+diff --git a/toolkit/components/ml/backends/llama/moz.build b/toolkit/components/ml/backends/llama/moz.build
+index 806f9c7587..3428f035c5 100644
+--- a/toolkit/components/ml/backends/llama/moz.build
++++ b/toolkit/components/ml/backends/llama/moz.build
+@@ -2,7 +2,7 @@
+ # License, v. 2.0. If a copy of the MPL was not distributed with this
+ # file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ 
+-if CONFIG["MOZ_WIDGET_TOOLKIT"] != "android":
++if CONFIG["MOZ_WIDGET_TOOLKIT"] != "android" and not CONFIG["MOZ_IOS_LEGACY"]:
+     DIRS += ["/third_party/llama.cpp"]
+ 
+     UNIFIED_SOURCES += [
+diff --git a/toolkit/components/ml/moz.build b/toolkit/components/ml/moz.build
+index 3fdbec1db5..e16154926e 100644
+--- a/toolkit/components/ml/moz.build
++++ b/toolkit/components/ml/moz.build
+@@ -18,7 +18,7 @@ DIRS += [
+     "tests",
+ ]
+ 
+-if CONFIG["MOZ_WIDGET_TOOLKIT"] != "android":
++if CONFIG["MOZ_WIDGET_TOOLKIT"] != "android" and not CONFIG["MOZ_IOS_LEGACY"]:
+     DIRS += ["backends/llama"]
+ 
+ XPCSHELL_TESTS_MANIFESTS += ["tests/xpcshell/xpcshell.toml"]
+diff --git a/toolkit/moz.configure b/toolkit/moz.configure
+index 9c9b280a0e..d0aca3abc5 100644
+--- a/toolkit/moz.configure
++++ b/toolkit/moz.configure
+@@ -2580,8 +2580,12 @@ def ffvpx(target):
+                 "-D__x86_64__",
+                 "-Pconfig_darwin64.asm",
+             ]
+-        elif target.cpu in ("aarch64", "arm"):
+-            # armv7 iOS (LegacyFox): the C and NEON paths, like Android arm
++        elif target.cpu == "aarch64":
++            use_nasm = False
++        elif target.cpu == "arm":
++            # LegacyFox, armv7 iOS: no assembly at all (ffmpeg's arm asm is
++            # GNU/ELF only), so no flags and no arch directories.
++            flags = []
+             use_nasm = False
+     elif target.os == "Android":
+         if target.cpu == "x86_64":
+@@ -2616,7 +2620,12 @@ def ffvpx_nasm():
+ # on a compiler test, so we have to do a little bit of dance here.
+ @depends(ffvpx, vpx_as_flags, target)
+ def ffvpx(ffvpx, vpx_as_flags, target):
+-    if ffvpx and vpx_as_flags and target.cpu in ("arm", "aarch64"):
++    if (
++        ffvpx
++        and vpx_as_flags
++        and target.cpu in ("arm", "aarch64")
++        and not (target.os == "iOS" and target.cpu == "arm")
++    ):
+         ffvpx.flags.extend(vpx_as_flags)
+     return ffvpx
+ 
+-- 
+2.53.0
+

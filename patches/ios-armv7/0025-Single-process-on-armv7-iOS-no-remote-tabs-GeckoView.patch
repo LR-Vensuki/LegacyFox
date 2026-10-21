@@ -1,0 +1,63 @@
+From 9ef371483785708520bb54dfbe81c5e5e6ff9497 Mon Sep 17 00:00:00 2001
+From: LR-Vensuki <260785366+LR-Vensuki@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 00:33:06 +0300
+Subject: [PATCH 25/42] Single process on armv7 iOS: no remote tabs,
+ GeckoView's browser in the parent
+
+---
+ mobile/shared/chrome/geckoview/geckoview.js | 20 +++++++++++---------
+ toolkit/xre/nsAppRunner.cpp                 |  7 +++++++
+ 2 files changed, 18 insertions(+), 9 deletions(-)
+
+diff --git a/mobile/shared/chrome/geckoview/geckoview.js b/mobile/shared/chrome/geckoview/geckoview.js
+index 656a68e971..aed4c95411 100644
+--- a/mobile/shared/chrome/geckoview/geckoview.js
++++ b/mobile/shared/chrome/geckoview/geckoview.js
+@@ -433,15 +433,17 @@ function createBrowser(settings) {
+   browser.setAttribute("type", "content");
+   browser.setAttribute("primary", "true");
+   browser.setAttribute("flex", "1");
+-  browser.setAttribute("maychangeremoteness", "true");
+-  browser.setAttribute("remote", "true");
+-  browser.setAttribute(
+-    "remoteType",
+-    ChromeUtils.predictRemoteTypeForURI(null, {
+-      window,
+-      geckoViewSessionContextId: settings.sessionContextId ?? undefined,
+-    })
+-  );
++  if (Services.appinfo.browserTabsRemoteAutostart) {
++    browser.setAttribute("maychangeremoteness", "true");
++    browser.setAttribute("remote", "true");
++    browser.setAttribute(
++      "remoteType",
++      ChromeUtils.predictRemoteTypeForURI(null, {
++        window,
++        geckoViewSessionContextId: settings.sessionContextId ?? undefined,
++      })
++    );
++  }
+   browser.setAttribute("messagemanagergroup", "browsers");
+   browser.setAttribute("manualactiveness", "true");
+ 
+diff --git a/toolkit/xre/nsAppRunner.cpp b/toolkit/xre/nsAppRunner.cpp
+index 64770f86aa..b5c2d18715 100644
+--- a/toolkit/xre/nsAppRunner.cpp
++++ b/toolkit/xre/nsAppRunner.cpp
+@@ -573,6 +573,13 @@ bool BrowserTabsRemoteAutostart() {
+     return gBrowserTabsRemoteAutostart;
+   }
+ 
++#if defined(MOZ_IOS_LEGACY)
++  // LegacyFox runs Gecko in one process; there is no content process to start.
++  gBrowserTabsRemoteAutostart = false;
++  gBrowserTabsRemoteStatus = kE10sForceDisabled;
++  return gBrowserTabsRemoteAutostart;
++#endif
++
+   gBrowserTabsRemoteAutostart = true;
+   E10sStatus status = kE10sEnabledByDefault;
+ 
+-- 
+2.53.0
+

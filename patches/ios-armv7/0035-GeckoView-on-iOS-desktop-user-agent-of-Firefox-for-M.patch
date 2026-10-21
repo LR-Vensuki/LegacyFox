@@ -1,0 +1,40 @@
+From c442cc7140553cb79957ec8aa5d1aa22daacd383 Mon Sep 17 00:00:00 2001
+From: LR-Vensuki <260785366+LR-Vensuki@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 22:35:04 +0300
+Subject: [PATCH 35/42] GeckoView on iOS: desktop user agent of Firefox for Mac
+
+---
+ .../shared/modules/geckoview/GeckoViewSettings.sys.mjs | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/mobile/shared/modules/geckoview/GeckoViewSettings.sys.mjs b/mobile/shared/modules/geckoview/GeckoViewSettings.sys.mjs
+index 8fb59f0a7f..3f4fc9f58a 100644
+--- a/mobile/shared/modules/geckoview/GeckoViewSettings.sys.mjs
++++ b/mobile/shared/modules/geckoview/GeckoViewSettings.sys.mjs
+@@ -2,6 +2,7 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+  * You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
++import { AppConstants } from "resource://gre/modules/AppConstants.sys.mjs";
+ import { GeckoViewModule } from "resource://gre/modules/GeckoViewModule.sys.mjs";
+ 
+ const lazy = {};
+@@ -62,6 +63,15 @@ export class GeckoViewSettings extends GeckoViewModule {
+       return Services.rfp.getSpoofedUserAgent(true);
+     }
+ 
++    if (AppConstants.platform == "ios") {
++      // Desktop sites as for Firefox on a Mac, the way iPad Safari asks.
++      return this.getMobileUserAgent()
++        .replace(/\([^)]*\)/, "(Macintosh; Intel Mac OS X 10.15; rv:" +
++          Services.appinfo.platformVersion.split(".")[0] + ".0)")
++        .replace(/Gecko\/[0-9\.]+/, "Gecko/20100101")
++        .replace(/ Mobile\/\S+/, "");
++    }
++
+     return this.getMobileUserAgent()
+       .replace(/Android \d.+?; [a-zA-Z]+/, "X11; Linux x86_64")
+       .replace(/Gecko\/[0-9\.]+/, "Gecko/20100101");
+-- 
+2.53.0
+

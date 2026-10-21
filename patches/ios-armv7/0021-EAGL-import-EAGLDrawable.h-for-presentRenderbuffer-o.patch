@@ -1,0 +1,25 @@
+From 60e6f347d4fd4660db9ee7d16647da054990cea4 Mon Sep 17 00:00:00 2001
+From: LR-Vensuki <260785366+LR-Vensuki@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 00:20:45 +0300
+Subject: [PATCH 21/42] EAGL: import EAGLDrawable.h for presentRenderbuffer: on
+ the iOS 6 SDK
+
+---
+ gfx/gl/GLContextProviderEAGL.mm | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/gfx/gl/GLContextProviderEAGL.mm b/gfx/gl/GLContextProviderEAGL.mm
+index bbc00d73b7..e6bbd5a065 100644
+--- a/gfx/gl/GLContextProviderEAGL.mm
++++ b/gfx/gl/GLContextProviderEAGL.mm
+@@ -4,6 +4,7 @@
+ 
+ #include "GLContextProvider.h"
+ #include "GLContextEAGL.h"
++#import <OpenGLES/EAGLDrawable.h>  // presentRenderbuffer: (not via EAGL.h on iOS 6)
+ #include "GLLibraryLoader.h"
+ #include "nsDebug.h"
+ #include "nsIWidget.h"
+-- 
+2.53.0
+

@@ -1,0 +1,357 @@
+From ca1259fa7fb6eafd1ba4b1aa70ed03a121950301 Mon Sep 17 00:00:00 2001
+From: LR-Vensuki <260785366+LR-Vensuki@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 05:49:46 +0300
+Subject: [PATCH 09/42] armv7 iOS 6: Mach IPC channel and kqueue pump without
+ iOS 7/8 APIs, ProcInfo from TASK_BASIC_INFO, NSS without ARMv8 crypto or
+ auxv, no ObjC generics in nsWindow
+
+---
+ ipc/chromium/src/base/message_pump_kqueue.cc  |  4 +-
+ .../src/chrome/common/ipc_channel_mach.cc     | 36 ++++++++++++-
+ security/nss/lib/freebl/blinit.c              | 24 ++++-----
+ security/nss/lib/freebl/freebl.gyp            |  9 ++++
+ toolkit/components/processtools/ProcInfo.mm   | 53 +++++++++++++++++++
+ widget/uikit/nsWindow.mm                      | 18 +++----
+ 6 files changed, 120 insertions(+), 24 deletions(-)
+
+diff --git a/ipc/chromium/src/base/message_pump_kqueue.cc b/ipc/chromium/src/base/message_pump_kqueue.cc
+index 7159a223f4..46c1d5363a 100644
+--- a/ipc/chromium/src/base/message_pump_kqueue.cc
++++ b/ipc/chromium/src/base/message_pump_kqueue.cc
+@@ -6,7 +6,7 @@
+ 
+ #include <sys/errno.h>
+ 
+-#ifdef XP_IOS
++#if defined(XP_IOS) && !defined(MOZ_IOS_LEGACY)
+ #  include <BrowserEngineCore/BEkevent.h>
+ #endif
+ 
+@@ -24,7 +24,7 @@ namespace {
+ // sandbox, so instead we use `be_kevent64` from the BrowserEngineCore library.
+ static int platform_kevent64(int fd, const kevent64_s* changelist, int nchanges,
+                              kevent64_s* eventlist, int nevents, int flags) {
+-#ifdef XP_IOS
++#if defined(XP_IOS) && !defined(MOZ_IOS_LEGACY)
+   return be_kevent64(fd, changelist, nchanges, eventlist, nevents, flags);
+ #else
+   return kevent64(fd, changelist, nchanges, eventlist, nevents, flags, nullptr);
+diff --git a/ipc/chromium/src/chrome/common/ipc_channel_mach.cc b/ipc/chromium/src/chrome/common/ipc_channel_mach.cc
+index 68d1b07ba5..7a0ac75ece 100644
+--- a/ipc/chromium/src/chrome/common/ipc_channel_mach.cc
++++ b/ipc/chromium/src/chrome/common/ipc_channel_mach.cc
+@@ -221,7 +221,11 @@ bool ChannelMach::ProcessIncomingMessage() {
+       header,
+       MACH_RCV_MSG | MACH_RCV_TIMEOUT |
+           MACH_RCV_TRAILER_TYPE(MACH_MSG_TRAILER_FORMAT_0) |
+-          MACH_RCV_TRAILER_ELEMENTS(MACH_RCV_TRAILER_AUDIT) | MACH_RCV_VOUCHER,
++          MACH_RCV_TRAILER_ELEMENTS(MACH_RCV_TRAILER_AUDIT)
++#if !defined(MOZ_IOS_LEGACY)  // vouchers are iOS 8
++          | MACH_RCV_VOUCHER
++#endif
++      ,
+       0, header->msgh_size, receive_port_.get(), /* timeout */ 0,
+       MACH_PORT_NULL);
+   if (kr != KERN_SUCCESS) {
+@@ -270,7 +274,11 @@ bool ChannelMach::ProcessIncomingMessage() {
+   // Read out descriptors from the sent message.
+   auto* msg_body = buf_helper.Next<mach_msg_body_t>();
+   if ((msg_body->msgh_descriptor_count > 0) !=
++#if defined(MOZ_IOS_LEGACY)  // MACH_MSGH_BITS_IS_COMPLEX is in newer SDKs only
++      ((header->msgh_bits & MACH_MSGH_BITS_COMPLEX) != 0)) {
++#else
+       MACH_MSGH_BITS_IS_COMPLEX(header->msgh_bits)) {
++#endif
+     CHROMIUM_LOG(ERROR)
+         << "expected msgh_descriptor_count to match MACH_MSGH_BITS_COMPLEX";
+     return false;
+@@ -360,11 +368,13 @@ bool ChannelMach::ProcessIncomingMessage() {
+       mozilla::MakeUnique<Message>(payload.data(), payload.size());
+ 
+   // Transfer ownership of the voucher port into the IPC::Message.
++#if !defined(MOZ_IOS_LEGACY)
+   if (MACH_MSGH_BITS_VOUCHER(header->msgh_bits) == MACH_MSG_TYPE_MOVE_SEND) {
+     message->mach_voucher_.reset(header->msgh_voucher_port);
+     header->msgh_voucher_port = MACH_PORT_NULL;
+     header->msgh_bits &= ~MACH_MSGH_BITS_VOUCHER_MASK;
+   }
++#endif
+ 
+   // Unwrap any fileports attached to this message into FDs. FDs are always
+   // added after other mach port rights, so we can assume the last
+@@ -725,6 +735,29 @@ bool ChannelMach::CreateRawPipe(ChannelHandle* server, ChannelHandle* client) {
+ // static
+ bool ChannelMach::CreateRawPipe(mozilla::UniqueMachReceiveRight* server,
+                                 mozilla::UniqueMachSendRight* client) {
++#if defined(MOZ_IOS_LEGACY)
++  // mach_port_construct is iOS 7: allocate, add the send right and raise the
++  // queue limit the old way.
++  mach_port_t port = MACH_PORT_NULL;
++  kern_return_t kr =
++      mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &port);
++  if (kr == KERN_SUCCESS) {
++    kr = mach_port_insert_right(mach_task_self(), port, port,
++                                MACH_MSG_TYPE_MAKE_SEND);
++  }
++  if (kr == KERN_SUCCESS) {
++    mach_port_limits_t limits{};
++    limits.mpl_qlimit = MACH_PORT_QLIMIT_LARGE;
++    kr = mach_port_set_attributes(mach_task_self(), port, MACH_PORT_LIMITS_INFO,
++                                  (mach_port_info_t)&limits,
++                                  MACH_PORT_LIMITS_INFO_COUNT);
++  }
++  if (kr != KERN_SUCCESS) {
++    CHROMIUM_LOG(ERROR) << "mach_port_allocate failed: "
++                        << mach_error_string(kr);
++    return false;
++  }
++#else
+   mach_port_options_t options{};
+   options.flags = MPO_INSERT_SEND_RIGHT | MPO_QLIMIT;
+   options.mpl.mpl_qlimit = MACH_PORT_QLIMIT_LARGE;
+@@ -736,6 +769,7 @@ bool ChannelMach::CreateRawPipe(mozilla::UniqueMachReceiveRight* server,
+                         << mach_error_string(kr);
+     return false;
+   }
++#endif
+ 
+   // Within a single task, all references to the same port have the same name.
+   // Thanks to `MPO_INSERT_SEND_RIGHT`, both a send and receive right were
+diff --git a/security/nss/lib/freebl/blinit.c b/security/nss/lib/freebl/blinit.c
+index be68a32bed..7e21e50a49 100644
+--- a/security/nss/lib/freebl/blinit.c
++++ b/security/nss/lib/freebl/blinit.c
+@@ -144,6 +144,18 @@ CheckX86CPUSupport()
+ }
+ #endif /* NSS_X86_OR_X64 */
+ 
++#if defined(__arm__) && defined(TARGET_OS_IPHONE)
++/* armv7 iOS (LegacyFox): no auxv. NEON is always there, the ARMv8 crypto
++ * extensions never are. */
++static unsigned long (*getauxval)(unsigned long) = NULL;
++#ifndef AT_HWCAP
++#define AT_HWCAP 16
++#endif
++#ifndef AT_HWCAP2
++#define AT_HWCAP2 26
++#endif
++#endif
++
+ /* clang-format off */
+ #if (defined(__aarch64__) || defined(__arm__)) && !defined(TARGET_OS_IPHONE)
+ #ifndef __has_include
+@@ -160,18 +172,6 @@ extern unsigned long getauxval(unsigned long type) __attribute__((weak));
+ static unsigned long (*getauxval)(unsigned long) = NULL;
+ #endif /* defined(__GNUC__) && __GNUC__ >= 2 && defined(__ELF__)*/
+ 
+-#if defined(__arm__) && defined(TARGET_OS_IPHONE)
+-/* armv7 iOS (LegacyFox): no auxv. NEON is always there, the ARMv8 crypto
+- * extensions never are. */
+-static unsigned long (*getauxval)(unsigned long) = NULL;
+-#ifndef AT_HWCAP
+-#define AT_HWCAP 16
+-#endif
+-#ifndef AT_HWCAP2
+-#define AT_HWCAP2 26
+-#endif
+-#endif
+-
+ #if (defined(__FreeBSD__) || defined(__OpenBSD__)) && __has_include(<sys/auxv.h>)
+ /* Avoid conflict with static declaration above */
+ #define getauxval freebl_getauxval
+diff --git a/security/nss/lib/freebl/freebl.gyp b/security/nss/lib/freebl/freebl.gyp
+index cf5616c0f4..a6f7cfadf4 100644
+--- a/security/nss/lib/freebl/freebl.gyp
++++ b/security/nss/lib/freebl/freebl.gyp
+@@ -284,6 +284,15 @@
+         '<(DEPTH)/exports.gyp:nss_exports'
+       ],
+       'conditions': [
++        # LegacyFox: with all ARMv8 crypto disabled (armv7 iOS) nothing here
++        # is used, and Apple's armv7 target cannot enable the extensions.
++        [ 'disable_arm_hw_aes==1 and disable_arm_hw_sha1==1 and disable_arm_hw_sha2==1', {
++          'sources!': [
++            'aes-armv8.c',
++            'sha1-armv8.c',
++            'sha256-armv8.c',
++          ],
++        }],
+         [ 'target_arch=="arm"', {
+           'cflags': [
+             '-march=armv8-a',
+diff --git a/toolkit/components/processtools/ProcInfo.mm b/toolkit/components/processtools/ProcInfo.mm
+index 8e5b6a4aa3..95d329b0aa 100644
+--- a/toolkit/components/processtools/ProcInfo.mm
++++ b/toolkit/components/processtools/ProcInfo.mm
+@@ -24,10 +24,38 @@ static void GetTimeBase(mach_timebase_info_data_t* timebase) {
+ 
+ namespace mozilla {
+ 
++#if defined(MOZ_IOS_LEGACY)
++// iOS 4-7 have neither TASK_VM_INFO (phys_footprint) nor TASK_POWER_INFO;
++// TASK_BASIC_INFO gives resident size and CPU time.
++static bool LegacyTaskInfo(task_t aTask, uint64_t* aCpuNs, uint64_t* aResident) {
++  task_basic_info_data_t info;
++  mach_msg_type_number_t count = TASK_BASIC_INFO_COUNT;
++  if (task_info(aTask, TASK_BASIC_INFO, (task_info_t)&info, &count) !=
++      KERN_SUCCESS) {
++    return false;
++  }
++  if (aCpuNs) {
++    *aCpuNs = (uint64_t(info.user_time.seconds) + info.system_time.seconds) *
++                  PR_NSEC_PER_SEC +
++              (uint64_t(info.user_time.microseconds) +
++               info.system_time.microseconds) *
++                  PR_NSEC_PER_USEC;
++  }
++  if (aResident) {
++    *aResident = info.resident_size;
++  }
++  return true;
++}
++#endif
++
+ nsresult GetCurrentProcessMemoryUsage(uint64_t* aResult) {
+   if (!aResult) {
+     return NS_ERROR_INVALID_ARG;
+   }
++#if defined(MOZ_IOS_LEGACY)
++  return LegacyTaskInfo(mach_task_self(), nullptr, aResult) ? NS_OK
++                                                             : NS_ERROR_FAILURE;
++#else
+   task_vm_info_data_t info;
+   mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+ 
+@@ -40,9 +68,18 @@ nsresult GetCurrentProcessMemoryUsage(uint64_t* aResult) {
+   // phys_footprint matches Activity Monitor’s “Memory” column on macOS 10.11+
+   *aResult = info.phys_footprint;
+   return NS_OK;
++#endif
+ }
+ 
+ nsresult GetCpuTimeSinceProcessStartInMs(uint64_t* aResult) {
++#if defined(MOZ_IOS_LEGACY)
++  uint64_t ns;
++  if (!LegacyTaskInfo(mach_task_self(), &ns, nullptr)) {
++    return NS_ERROR_FAILURE;
++  }
++  *aResult = ns / PR_NSEC_PER_MSEC;
++  return NS_OK;
++#else
+   task_power_info_data_t task_power_info;
+   mach_msg_type_number_t count = TASK_POWER_INFO_COUNT;
+   kern_return_t kr = task_info(mach_task_self(), TASK_POWER_INFO,
+@@ -57,9 +94,13 @@ nsresult GetCpuTimeSinceProcessStartInMs(uint64_t* aResult) {
+   *aResult = (task_power_info.total_user + task_power_info.total_system) *
+              timebase.numer / timebase.denom / PR_NSEC_PER_MSEC;
+   return NS_OK;
++#endif
+ }
+ 
+ nsresult GetGpuTimeSinceProcessStartInMs(uint64_t* aResult) {
++#if defined(MOZ_IOS_LEGACY)
++  return NS_ERROR_NOT_IMPLEMENTED;
++#else
+   task_power_info_v2_data_t task_power_info;
+   mach_msg_type_number_t count = TASK_POWER_INFO_V2_COUNT;
+   kern_return_t kr = task_info(mach_task_self(), TASK_POWER_INFO_V2,
+@@ -70,6 +111,7 @@ nsresult GetGpuTimeSinceProcessStartInMs(uint64_t* aResult) {
+ 
+   *aResult = task_power_info.gpu_energy.task_gpu_utilisation / PR_NSEC_PER_MSEC;
+   return NS_OK;
++#endif
+ }
+ 
+ int GetCycleTimeFrequencyMHz() { return 0; }
+@@ -105,6 +147,16 @@ ProcInfoPromise::ResolveOrRejectValue GetProcInfoSync(
+       selectedTask = request.childTask;
+     }
+ 
++#if defined(MOZ_IOS_LEGACY)
++    uint64_t cpuNs, resident;
++    if (!LegacyTaskInfo(selectedTask, &cpuNs, &resident)) {
++      continue;
++    }
++    info.cpuTime = cpuNs;
++    info.memory = resident;
++    mach_msg_type_number_t count;
++    kern_return_t kr;
++#else
+     task_power_info_data_t task_power_info;
+     mach_msg_type_number_t count = TASK_POWER_INFO_COUNT;
+     kern_return_t kr = task_info(selectedTask, TASK_POWER_INFO,
+@@ -125,6 +177,7 @@ ProcInfoPromise::ResolveOrRejectValue GetProcInfoSync(
+     kr = task_info(selectedTask, TASK_VM_INFO, (task_info_t)&task_vm_info,
+                    &count);
+     info.memory = kr == KERN_SUCCESS ? task_vm_info.phys_footprint : 0;
++#endif
+ 
+     // Now getting threads info
+ 
+diff --git a/widget/uikit/nsWindow.mm b/widget/uikit/nsWindow.mm
+index 61687c8cd9..01907f7f11 100644
+--- a/widget/uikit/nsWindow.mm
++++ b/widget/uikit/nsWindow.mm
+@@ -95,7 +95,7 @@ class nsAutoRetainUIKitObject {
+  @public
+   nsWindow* mGeckoChild;  // weak ref
+   BOOL mWaitingForPaint;
+-  NSMapTable<UITouch*, NSNumber*>* mTouches;
++  NSMapTable* mTouches;
+   int mNextTouchID;
+ 
+   // The CALayer that wraps Gecko's rendered contents. It's a sublayer of
+@@ -122,10 +122,10 @@ class nsAutoRetainUIKitObject {
+                touches:(NSSet*)aTouches
+                 widget:(nsWindow*)aWindow;
+ // Event handling (UIResponder)
+-- (void)touchesBegan:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event;
+-- (void)touchesCancelled:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event;
+-- (void)touchesEnded:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event;
+-- (void)touchesMoved:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event;
++- (void)touchesBegan:(NSSet*)touches withEvent:(UIEvent*)event;
++- (void)touchesCancelled:(NSSet*)touches withEvent:(UIEvent*)event;
++- (void)touchesEnded:(NSSet*)touches withEvent:(UIEvent*)event;
++- (void)touchesMoved:(NSSet*)touches withEvent:(UIEvent*)event;
+ // Reacts to the view being resized.
+ - (void)layoutSubviews;
+ 
+@@ -288,7 +288,7 @@ class nsAutoRetainUIKitObject {
+   aWindow->DispatchInputEvent(&event);
+ }
+ 
+-- (void)touchesBegan:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event {
++- (void)touchesBegan:(NSSet*)touches withEvent:(UIEvent*)event {
+   ALOG("[ChildView[%p] touchesBegan", self);
+   if (!mGeckoChild) return;
+ 
+@@ -301,7 +301,7 @@ class nsAutoRetainUIKitObject {
+                 widget:mGeckoChild];
+ }
+ 
+-- (void)touchesCancelled:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event {
++- (void)touchesCancelled:(NSSet*)touches withEvent:(UIEvent*)event {
+   ALOG("[ChildView[%p] touchesCancelled", self);
+   [self sendTouchEvent:eTouchCancel touches:touches widget:mGeckoChild];
+   for (UITouch* touch : touches) {
+@@ -312,7 +312,7 @@ class nsAutoRetainUIKitObject {
+   }
+ }
+ 
+-- (void)touchesEnded:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event {
++- (void)touchesEnded:(NSSet*)touches withEvent:(UIEvent*)event {
+   ALOG("[ChildView[%p] touchesEnded", self);
+   if (!mGeckoChild) return;
+ 
+@@ -325,7 +325,7 @@ class nsAutoRetainUIKitObject {
+   }
+ }
+ 
+-- (void)touchesMoved:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event {
++- (void)touchesMoved:(NSSet*)touches withEvent:(UIEvent*)event {
+   ALOG("[ChildView[%p] touchesMoved", self);
+   if (!mGeckoChild) return;
+ 
+-- 
+2.53.0
+

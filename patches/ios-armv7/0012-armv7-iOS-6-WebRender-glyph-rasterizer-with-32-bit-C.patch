@@ -1,0 +1,185 @@
+From d5607a7cf4ca874c3960cb8eded577a2d72d7aa9 Mon Sep 17 00:00:00 2001
+From: LR-Vensuki <260785366+LR-Vensuki@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 22:55:13 +0300
+Subject: [PATCH 12/42] armv7 iOS 6: WebRender glyph rasterizer with 32-bit
+ CGFloat, CoreAnimation layers without iOS 11 corner masks or macOS colors
+
+---
+ gfx/layers/NativeLayerCA.mm                   | 16 ++++++-
+ gfx/layers/NativeLayerRootRemoteMacChild.mm   |  2 +-
+ .../src/platform/macos/font.rs                | 43 ++++++++++---------
+ 3 files changed, 37 insertions(+), 24 deletions(-)
+
+diff --git a/gfx/layers/NativeLayerCA.mm b/gfx/layers/NativeLayerCA.mm
+index 41c09dd741..122442575e 100644
+--- a/gfx/layers/NativeLayerCA.mm
++++ b/gfx/layers/NativeLayerCA.mm
+@@ -12,6 +12,14 @@
+ #import <AVFoundation/AVFoundation.h>
+ #if defined(MOZ_IOS_LEGACY)
+ #  import <legacyfox/AVSampleBufferDisplayLayer.h>
++// CACornerMask is iOS 11; only computed, never applied there.
++typedef NSUInteger CACornerMask;
++enum {
++  kCALayerMinXMinYCorner = 1U << 0,
++  kCALayerMaxXMinYCorner = 1U << 1,
++  kCALayerMinXMaxYCorner = 1U << 2,
++  kCALayerMaxXMaxYCorner = 1U << 3,
++};
+ #endif
+ #import <QuartzCore/QuartzCore.h>
+ 
+@@ -1844,10 +1852,10 @@ bool NativeLayerCARepresentation::ApplyChanges(
+     mOpaquenessTintLayer.contentsGravity = kCAGravityTopLeft;
+     if (aIsOpaque) {
+       mOpaquenessTintLayer.backgroundColor =
+-          CGColorCreateGenericRGB(0, 1, 0, 0.5);
++          CGColorCreateForDeviceColor(gfx::DeviceColor(0, 1, 0, 0.5));
+     } else {
+       mOpaquenessTintLayer.backgroundColor =
+-          CGColorCreateGenericRGB(1, 0, 0, 0.5);
++          CGColorCreateForDeviceColor(gfx::DeviceColor(1, 0, 0, 0.5));
+     }
+     [mRoundedClipCALayer addSublayer:mOpaquenessTintLayer];
+   } else if (!shouldTintOpaqueness && mOpaquenessTintLayer) {
+@@ -1916,7 +1924,9 @@ bool NativeLayerCARepresentation::ApplyChanges(
+     // mutated and don't get selected below.
+     mRoundedClipCALayer.cornerRadius = 0.0f;
+     mRoundedClipCALayer.masksToBounds = NO;
++#if !defined(MOZ_IOS_LEGACY)  // maskedCorners is iOS 11: all four round there
+     mRoundedClipCALayer.maskedCorners = 0;
++#endif
+ 
+     if (aRoundedClip.isSome()) {
+       // Select which corner(s) the rounded clip should be applied to
+@@ -1958,7 +1968,9 @@ bool NativeLayerCARepresentation::ApplyChanges(
+ 
+         mRoundedClipCALayer.cornerRadius = effectiveRadius / aBackingScale;
+         mRoundedClipCALayer.masksToBounds = YES;
++#if !defined(MOZ_IOS_LEGACY)
+         mRoundedClipCALayer.maskedCorners = maskedCorners;
++#endif
+       }
+     }
+ 
+diff --git a/gfx/layers/NativeLayerRootRemoteMacChild.mm b/gfx/layers/NativeLayerRootRemoteMacChild.mm
+index da1f187091..2416d1cfae 100644
+--- a/gfx/layers/NativeLayerRootRemoteMacChild.mm
++++ b/gfx/layers/NativeLayerRootRemoteMacChild.mm
+@@ -155,7 +155,7 @@ void NativeLayerRootRemoteMacChild::CommitForSnapshot(CALayer* aRootCALayer) {
+   [CATransaction begin];
+   [CATransaction setDisableActions:YES];  // disable cross-fade
+ 
+-  NSMutableArray<CALayer*>* sublayers =
++  NSMutableArray* sublayers =
+       [NSMutableArray arrayWithCapacity:mNativeLayers.Length()];
+   for (const auto& layer : mNativeLayers) {
+     layer->UpdateSnapshotLayer();
+diff --git a/gfx/wr/wr_glyph_rasterizer/src/platform/macos/font.rs b/gfx/wr/wr_glyph_rasterizer/src/platform/macos/font.rs
+index fce3e07e5b..ffe999d6b4 100644
+--- a/gfx/wr/wr_glyph_rasterizer/src/platform/macos/font.rs
++++ b/gfx/wr/wr_glyph_rasterizer/src/platform/macos/font.rs
+@@ -10,6 +10,7 @@ use core_foundation::dictionary::CFDictionary;
+ use core_foundation::number::{CFNumber};
+ use core_foundation::string::CFString;
+ use core_foundation::url::{CFURL, kCFURLPOSIXPathStyle};
++use core_graphics::base::CGFloat;
+ use core_graphics::base::{kCGImageAlphaNoneSkipFirst, kCGImageAlphaPremultipliedFirst};
+ use core_graphics::base::{kCGBitmapByteOrder32Little};
+ use core_graphics::color_space::CGColorSpace;
+@@ -161,10 +162,10 @@ fn get_glyph_metrics(
+     }
+ 
+     if bounds.size.width > 0.0 {
+-        bounds.size.width += extra_width;
++        bounds.size.width += extra_width as CGFloat;
+     }
+     if advance.width > 0.0 {
+-        advance.width += extra_width;
++        advance.width += extra_width as CGFloat;
+     }
+ 
+     if let Some(transform) = transform {
+@@ -175,8 +176,8 @@ fn get_glyph_metrics(
+     // CG Origin is bottom left
+     let mut left = bounds.origin.x.floor() as i32;
+     let mut bottom = bounds.origin.y.floor() as i32;
+-    let mut right = (bounds.origin.x + bounds.size.width + x_offset).ceil() as i32;
+-    let mut top = (bounds.origin.y + bounds.size.height + y_offset).ceil() as i32;
++    let mut right = (bounds.origin.x as f64 + bounds.size.width as f64 + x_offset).ceil() as i32;
++    let mut top = (bounds.origin.y as f64 + bounds.size.height as f64 + y_offset).ceil() as i32;
+ 
+     // Expand the bounds by 1 pixel, to give CG room for anti-aliasing.
+     // Note that this outset is to allow room for LCD smoothed glyphs. However, the correct outset
+@@ -396,12 +397,12 @@ impl FontContext {
+                 }
+                 let transform = if !shape.is_identity() || (tx, ty) != (0.0, 0.0) {
+                     Some(CGAffineTransform {
+-                        a: shape.scale_x as f64,
+-                        b: -shape.skew_y as f64,
+-                        c: -shape.skew_x as f64,
+-                        d: shape.scale_y as f64,
+-                        tx: tx,
+-                        ty: -ty,
++                        a: shape.scale_x as CGFloat,
++                        b: -shape.skew_y as CGFloat,
++                        c: -shape.skew_x as CGFloat,
++                        d: shape.scale_y as CGFloat,
++                        tx: tx as CGFloat,
++                        ty: -ty as CGFloat,
+                     })
+                 } else {
+                     None
+@@ -568,12 +569,12 @@ impl FontContext {
+         }
+         let transform = if !shape.is_identity() || (tx, ty) != (0.0, 0.0) {
+             Some(CGAffineTransform {
+-                a: shape.scale_x as f64,
+-                b: -shape.skew_y as f64,
+-                c: -shape.skew_x as f64,
+-                d: shape.scale_y as f64,
+-                tx: tx,
+-                ty: -ty,
++                a: shape.scale_x as CGFloat,
++                b: -shape.skew_y as CGFloat,
++                c: -shape.skew_x as CGFloat,
++                d: shape.scale_y as CGFloat,
++                tx: tx as CGFloat,
++                ty: -ty as CGFloat,
+             })
+         } else {
+             None
+@@ -672,8 +673,8 @@ impl FontContext {
+             let rect = CGRect {
+                 origin: CGPoint { x: 0.0, y: 0.0 },
+                 size: CGSize {
+-                    width: metrics.rasterized_width as f64,
+-                    height: metrics.rasterized_height as f64,
++                    width: metrics.rasterized_width as CGFloat,
++                    height: metrics.rasterized_height as CGFloat,
+                 },
+             };
+ 
+@@ -694,8 +695,8 @@ impl FontContext {
+ 
+             // CG Origin is bottom left, WR is top left. Need -y offset
+             let mut draw_origin = CGPoint {
+-                x: -metrics.rasterized_left as f64 + x_offset + tx,
+-                y: metrics.rasterized_descent as f64 - y_offset - ty,
++                x: (-metrics.rasterized_left as f64 + x_offset + tx) as CGFloat,
++                y: (metrics.rasterized_descent as f64 - y_offset - ty) as CGFloat,
+             };
+ 
+             if let Some(transform) = transform {
+@@ -718,7 +719,7 @@ impl FontContext {
+             // (See https://bugzilla.mozilla.org/show_bug.cgi?id=1633397 for details.)
+             for i in 1 ..= extra_strikes {
+                 let origin = CGPoint {
+-                    x: draw_origin.x + i as f64 * pixel_step,
++                    x: draw_origin.x + (i as f64 * pixel_step) as CGFloat,
+                     y: draw_origin.y,
+                 };
+                 ct_font.draw_glyphs(&[glyph], &[origin], cg_context.clone());
+-- 
+2.53.0
+

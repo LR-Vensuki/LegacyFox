@@ -1,0 +1,24 @@
+{
+  "name": "LegacyFox",
+  "tagline": "Браузер на движке Firefox для iOS 5–7 (нестабильная бета)",
+  "compatible": "iOS 5.0 – 7.1.2 (проверено на iOS 6.1.3)",
+  "tint": "#234171",
+  "links": [
+    {
+      "title": "Исходный код (GitHub)",
+      "url": "https://github.com/LR-Vensuki/LegacyFox"
+    },
+    {
+      "title": "Движок Gecko (Mozilla, MPL 2.0)",
+      "url": "https://www.mozilla.org/MPL/2.0/"
+    },
+    {
+      "title": "Идеи оптимизации: gecko-w10m (Computershik73)",
+      "url": "https://github.com/Computershik73/gecko-w10m"
+    },
+    {
+      "title": "Оформление: Firefox Home для iOS (Mozilla, MPL)",
+      "url": "https://github.com/mozilla-services/ios-sync-client"
+    }
+  ]
+}

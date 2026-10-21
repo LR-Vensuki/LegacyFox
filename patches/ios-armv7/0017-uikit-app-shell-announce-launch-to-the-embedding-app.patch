@@ -1,0 +1,33 @@
+From 9f91b3d858b7740a72b961826cebeebf5646057b Mon Sep 17 00:00:00 2001
+From: LR-Vensuki <260785366+LR-Vensuki@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 23:23:12 +0300
+Subject: [PATCH 17/42] uikit app shell: announce launch to the embedding app
+ on iOS 4-7 (no scenes)
+
+---
+ widget/uikit/nsAppShell.mm | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/widget/uikit/nsAppShell.mm b/widget/uikit/nsAppShell.mm
+index 4441c8faf6..ceef771a0f 100644
+--- a/widget/uikit/nsAppShell.mm
++++ b/widget/uikit/nsAppShell.mm
+@@ -58,6 +58,15 @@ static void ApplicationWillTerminate(bool aCallExit);
+     didFinishLaunchingWithOptions:(NSDictionary*)launchOptions {
+   ALOG("[AppShellDelegate application:didFinishLaunchingWithOptions:]");
+ 
++#if defined(MOZ_IOS_LEGACY)
++  // iOS 4-7 have no scenes: the embedding app (LegacyFox's shell) builds its
++  // window when told the application has launched.
++  [[NSNotificationCenter defaultCenter]
++      postNotificationName:@"GeckoAppShellDidFinishLaunching"
++                    object:application
++                  userInfo:launchOptions];
++#endif
++
+   return YES;
+ }
+ 
+-- 
+2.53.0
+

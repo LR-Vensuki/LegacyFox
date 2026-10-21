@@ -1,0 +1,134 @@
+From b5517168b0d32af408fb04524fe31d81dfebcf53 Mon Sep 17 00:00:00 2001
+From: LR-Vensuki <260785366+LR-Vensuki@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 13:27:48 +0300
+Subject: [PATCH 28/42] jit/arm: iOS 4-7 calling convention for C++ calls
+
+32-bit iOS is softfp: doubles are returned in r0:r1, not d0. Its APCS
+variant also takes 64-bit arguments in any two consecutive registers
+(r1:r2) with 4-byte stack alignment, so register pairs may start on an
+odd register: no ldrd there, and pair overlap checks cover it.
+---
+ js/src/jit/MoveResolver.h          |  7 +++++++
+ js/src/jit/arm/Architecture-arm.h  |  5 ++++-
+ js/src/jit/arm/Assembler-arm.cpp   | 28 ++++++++++++++++++++++++++++
+ js/src/jit/arm/MoveEmitter-arm.cpp | 10 ++++++++++
+ 4 files changed, 49 insertions(+), 1 deletion(-)
+
+diff --git a/js/src/jit/MoveResolver.h b/js/src/jit/MoveResolver.h
+index 2eedaa46ae..0c3ae94e31 100644
+--- a/js/src/jit/MoveResolver.h
++++ b/js/src/jit/MoveResolver.h
+@@ -119,6 +119,13 @@ class MoveOperand {
+     // have to check any other register, or register pair.
+     if (isGeneralRegPair() || other.isGeneralRegPair()) {
+       if (isGeneralRegPair() && other.isGeneralRegPair()) {
++#ifdef MOZ_IOS_LEGACY
++        // 32-bit iOS pairs can start on an odd register (r1:r2), so pairs
++        // may overlap by one register.
++        return evenReg().aliases(other.evenReg()) ||
++               evenReg().aliases(other.oddReg()) ||
++               oddReg().aliases(other.evenReg());
++#endif
+         // Assume that register pairs are aligned on even registers.
+         MOZ_ASSERT(!evenReg().aliases(other.oddReg()));
+         MOZ_ASSERT(!oddReg().aliases(other.evenReg()));
+diff --git a/js/src/jit/arm/Architecture-arm.h b/js/src/jit/arm/Architecture-arm.h
+index 020da89179..d3e88401a9 100644
+--- a/js/src/jit/arm/Architecture-arm.h
++++ b/js/src/jit/arm/Architecture-arm.h
+@@ -770,7 +770,10 @@ class ARMFlags final {
+ // GCC versions 4.6 and above define __ARM_PCS_VFP to denote a hard-float
+ // ABI target. The iOS toolchain doesn't define anything specific here, but
+ // iOS always supports VFP.
+-#  if defined(__ARM_PCS_VFP) || defined(XP_IOS)
++// 32-bit iOS itself passes and returns doubles in core registers (softfp):
++// with the hard-float ABI, results of C++ math calls are read from d0 and
++// come out as garbage.
++#  if defined(__ARM_PCS_VFP) || (defined(XP_IOS) && !defined(MOZ_IOS_LEGACY))
+     return true;
+ #  else
+     return false;
+diff --git a/js/src/jit/arm/Assembler-arm.cpp b/js/src/jit/arm/Assembler-arm.cpp
+index 2fc4b9999e..e5f00471a0 100644
+--- a/js/src/jit/arm/Assembler-arm.cpp
++++ b/js/src/jit/arm/Assembler-arm.cpp
+@@ -59,6 +59,19 @@ ABIArg ABIArgGenerator::softNext(MIRType type) {
+       intRegIndex_++;
+       break;
+     case MIRType::Int64:
++#ifdef MOZ_IOS_LEGACY
++      // 32-bit iOS (APCS) takes 64-bit values in any two consecutive
++      // registers and aligns them on the stack to 4 bytes only. A value
++      // starting at r3 would be split between r3 and the stack, which ABIArg
++      // cannot express; no call made from JIT code has that shape.
++      MOZ_RELEASE_ASSERT(intRegIndex_ != NumIntArgRegs - 1,
++                         "64-bit ABI argument split between r3 and the stack");
++      if (intRegIndex_ == NumIntArgRegs) {
++        current_ = ABIArg(stackOffset_);
++        stackOffset_ += sizeof(uint64_t);
++        break;
++      }
++#else
+       // Make sure to use an even register index. Increase to next even number
+       // when odd.
+       intRegIndex_ = (intRegIndex_ + 1) & ~1;
+@@ -70,6 +83,7 @@ ABIArg ABIArgGenerator::softNext(MIRType type) {
+         stackOffset_ += sizeof(uint64_t);
+         break;
+       }
++#endif
+       current_ = ABIArg(Register::FromCode(intRegIndex_),
+                         Register::FromCode(intRegIndex_ + 1));
+       intRegIndex_ += 2;
+@@ -84,6 +98,19 @@ ABIArg ABIArgGenerator::softNext(MIRType type) {
+       intRegIndex_++;
+       break;
+     case MIRType::Double:
++#ifdef MOZ_IOS_LEGACY
++      // 32-bit iOS (APCS) takes 64-bit values in any two consecutive
++      // registers and aligns them on the stack to 4 bytes only. A value
++      // starting at r3 would be split between r3 and the stack, which ABIArg
++      // cannot express; no call made from JIT code has that shape.
++      MOZ_RELEASE_ASSERT(intRegIndex_ != NumIntArgRegs - 1,
++                         "64-bit ABI argument split between r3 and the stack");
++      if (intRegIndex_ == NumIntArgRegs) {
++        current_ = ABIArg(stackOffset_);
++        stackOffset_ += sizeof(double);
++        break;
++      }
++#else
+       // Make sure to use an even register index. Increase to next even number
+       // when odd.
+       intRegIndex_ = (intRegIndex_ + 1) & ~1;
+@@ -95,6 +122,7 @@ ABIArg ABIArgGenerator::softNext(MIRType type) {
+         stackOffset_ += sizeof(double);
+         break;
+       }
++#endif
+       current_ = ABIArg(Register::FromCode(intRegIndex_),
+                         Register::FromCode(intRegIndex_ + 1));
+       intRegIndex_ += 2;
+diff --git a/js/src/jit/arm/MoveEmitter-arm.cpp b/js/src/jit/arm/MoveEmitter-arm.cpp
+index e7dad5bed6..ea3e5ccea9 100644
+--- a/js/src/jit/arm/MoveEmitter-arm.cpp
++++ b/js/src/jit/arm/MoveEmitter-arm.cpp
+@@ -346,6 +346,16 @@ void MoveEmitterARM::emitDoubleMove(const MoveOperand& from,
+     // Warning: if the offset isn't within [-255,+255] then this
+     // will assert-fail (or, if non-debug, load the wrong words).
+     // Nothing uses such an offset at the time of this writing.
++#ifdef MOZ_IOS_LEGACY
++    // ldrd needs an even first register; 32-bit iOS pairs may start on an
++    // odd one (r1:r2).
++    if (to.evenReg().code() & 1) {
++      ScratchDoubleScope scratchDouble(masm);
++      masm.ma_vldr(src, scratchDouble, scratch);
++      masm.ma_vxfer(scratchDouble, to.evenReg(), to.oddReg());
++      return;
++    }
++#endif
+     masm.ma_ldrd(EDtrAddr(src.base, EDtrOffImm(src.offset)), to.evenReg(),
+                  to.oddReg());
+   } else {
+-- 
+2.53.0
+

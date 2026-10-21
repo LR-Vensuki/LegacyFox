@@ -1,0 +1,176 @@
+From b3cf6af7a0b2b4e79c01337e2eed7257250875d3 Mon Sep 17 00:00:00 2001
+From: LR-Vensuki <260785366+LR-Vensuki@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 18:01:20 +0300
+Subject: [PATCH 31/42] GeckoView on iOS keeps logins in Gecko's own store
+
+Saving or changing a password from the login prompt writes to
+Services.logins (logins.json, NSS-encrypted) on iOS, where autofill reads
+from it; LegacyFoxLogins lets the shell list, add and remove them.
+---
+ .../geckoview/GeckoViewStartup.sys.mjs        | 12 +++++
+ .../geckoview/LoginStorageDelegate.sys.mjs    | 27 +++++++++-
+ .../modules/geckoview/LegacyFoxLogins.sys.mjs | 50 +++++++++++++++++++
+ mobile/shared/modules/geckoview/moz.build     |  1 +
+ 4 files changed, 88 insertions(+), 2 deletions(-)
+ create mode 100644 mobile/shared/modules/geckoview/LegacyFoxLogins.sys.mjs
+
+diff --git a/mobile/shared/components/geckoview/GeckoViewStartup.sys.mjs b/mobile/shared/components/geckoview/GeckoViewStartup.sys.mjs
+index 3d46ebea91..57c4c1de29 100644
+--- a/mobile/shared/components/geckoview/GeckoViewStartup.sys.mjs
++++ b/mobile/shared/components/geckoview/GeckoViewStartup.sys.mjs
+@@ -2,6 +2,7 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
++import { AppConstants } from "resource://gre/modules/AppConstants.sys.mjs";
+ import { DelayedInit } from "resource://gre/modules/DelayedInit.sys.mjs";
+ import { GeckoViewUtils } from "resource://gre/modules/GeckoViewUtils.sys.mjs";
+ 
+@@ -117,6 +118,17 @@ export class GeckoViewStartup {
+           module: "resource://gre/modules/GeckoViewConsole.sys.mjs",
+         });
+ 
++        if (AppConstants.platform == "ios") {
++          GeckoViewUtils.addLazyGetter(this, "LegacyFoxLogins", {
++            module: "resource://gre/modules/LegacyFoxLogins.sys.mjs",
++            ged: [
++              "LegacyFox:Logins:Get",
++              "LegacyFox:Logins:Add",
++              "LegacyFox:Logins:Remove",
++            ],
++          });
++        }
++
+         GeckoViewUtils.addLazyGetter(this, "GeckoViewStorageController", {
+           module: "resource://gre/modules/GeckoViewStorageController.sys.mjs",
+           ged: [
+diff --git a/mobile/shared/components/geckoview/LoginStorageDelegate.sys.mjs b/mobile/shared/components/geckoview/LoginStorageDelegate.sys.mjs
+index f9d5d232ff..08c7c73c5c 100644
+--- a/mobile/shared/components/geckoview/LoginStorageDelegate.sys.mjs
++++ b/mobile/shared/components/geckoview/LoginStorageDelegate.sys.mjs
+@@ -3,6 +3,7 @@
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ import { GeckoViewUtils } from "resource://gre/modules/GeckoViewUtils.sys.mjs";
++import { AppConstants } from "resource://gre/modules/AppConstants.sys.mjs";
+ 
+ const lazy = {};
+ 
+@@ -21,6 +22,28 @@ const LoginStorageHint = {
+   LOW_CONFIDENCE: 1 << 1,
+ };
+ 
++// On iOS the logins live in Gecko's own store (logins.json, encrypted with
++// the NSS key in key4.db) rather than in the embedding app, as on desktop:
++// autofill reads that store, and Sync's passwords engine works on it.
++async function saveInGecko(selectedLogin, oldGuid) {
++  const login = lazy.LoginEntry.parse(selectedLogin).toLoginInfo();
++  const all = oldGuid ? await Services.logins.getAllLogins() : [];
++  const existing = all.find(l => l.guid == oldGuid);
++  if (existing) {
++    Services.logins.modifyLogin(existing, login);
++  } else {
++    await Services.logins.addLoginAsync(login);
++  }
++}
++
++function storeLogin(selectedLogin, oldGuid = null) {
++  if (AppConstants.platform == "ios") {
++    saveInGecko(selectedLogin, oldGuid).catch(e => warn`saving a login: ${e}`);
++  } else {
++    lazy.GeckoViewAutocomplete.onLoginSave(selectedLogin);
++  }
++}
++
+ export class LoginStorageDelegate {
+   _createMessage({ dismissed, autoSavedLoginGuid }, aLogins) {
+     let hint = LoginStorageHint.NONE;
+@@ -54,7 +77,7 @@ export class LoginStorageDelegate {
+         const loginInfo = lazy.LoginEntry.parse(selectedLogin).toLoginInfo();
+         Services.obs.notifyObservers(loginInfo, "passwordmgr-prompt-save");
+ 
+-        lazy.GeckoViewAutocomplete.onLoginSave(selectedLogin);
++        storeLogin(selectedLogin);
+       }
+     );
+ 
+@@ -90,7 +113,7 @@ export class LoginStorageDelegate {
+           return;
+         }
+ 
+-        lazy.GeckoViewAutocomplete.onLoginSave(selectedLogin);
++        storeLogin(selectedLogin, oldGuid);
+ 
+         const loginInfo = lazy.LoginEntry.parse(selectedLogin).toLoginInfo();
+         Services.obs.notifyObservers(
+diff --git a/mobile/shared/modules/geckoview/LegacyFoxLogins.sys.mjs b/mobile/shared/modules/geckoview/LegacyFoxLogins.sys.mjs
+new file mode 100644
+index 0000000000..a103caf26e
+--- /dev/null
++++ b/mobile/shared/modules/geckoview/LegacyFoxLogins.sys.mjs
+@@ -0,0 +1,50 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++// LegacyFox: the saved passwords screen of the iOS 4-7 shell reads and
++// removes logins in Gecko's own store through these runtime events.
++
++import { GeckoViewUtils } from "resource://gre/modules/GeckoViewUtils.sys.mjs";
++
++const { warn } = GeckoViewUtils.initLogging("LegacyFoxLogins");
++
++export const LegacyFoxLogins = {
++  async onEvent(aEvent, aData, aCallback) {
++    try {
++      switch (aEvent) {
++        case "LegacyFox:Logins:Get": {
++          const logins = await Services.logins.getAllLogins();
++          aCallback.onSuccess(
++            logins.map(l => ({
++              guid: l.guid,
++              origin: l.origin,
++              username: l.username,
++              password: l.password,
++            }))
++          );
++          break;
++        }
++        case "LegacyFox:Logins:Add": {
++          const login = Cc["@mozilla.org/login-manager/loginInfo;1"].createInstance(Ci.nsILoginInfo);
++          login.init(aData.origin, aData.origin, null, aData.username ?? "", aData.password, "", "");
++          const added = await Services.logins.addLoginAsync(login);
++          aCallback.onSuccess(added.guid);
++          break;
++        }
++        case "LegacyFox:Logins:Remove": {
++          const logins = await Services.logins.getAllLogins();
++          const login = logins.find(l => l.guid == aData.guid);
++          if (login) {
++            Services.logins.removeLogin(login);
++          }
++          aCallback.onSuccess(!!login);
++          break;
++        }
++      }
++    } catch (e) {
++      warn`${aEvent}: ${e}`;
++      aCallback.onError(String(e));
++    }
++  },
++};
+diff --git a/mobile/shared/modules/geckoview/moz.build b/mobile/shared/modules/geckoview/moz.build
+index b0a38a3b87..ccf93e66c1 100644
+--- a/mobile/shared/modules/geckoview/moz.build
++++ b/mobile/shared/modules/geckoview/moz.build
+@@ -37,6 +37,7 @@ EXTRA_JS_MODULES += [
+     "GeckoViewTranslations.sys.mjs",
+     "GeckoViewUtils.sys.mjs",
+     "GeckoViewWebExtension.sys.mjs",
++    "LegacyFoxLogins.sys.mjs",
+     "LoadURIDelegate.sys.mjs",
+     "MediaUtils.sys.mjs",
+     "Messaging.sys.mjs",
+-- 
+2.53.0
+

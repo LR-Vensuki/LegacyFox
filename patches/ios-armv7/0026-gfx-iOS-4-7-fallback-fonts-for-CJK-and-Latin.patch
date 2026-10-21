@@ -1,0 +1,35 @@
+From 453946f641c173804b9c310aa3a06fb00a32d20a Mon Sep 17 00:00:00 2001
+From: LR-Vensuki <260785366+LR-Vensuki@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 07:57:48 +0300
+Subject: [PATCH 26/42] gfx: iOS 4-7 fallback fonts for CJK and Latin
+
+---
+ gfx/thebes/gfxPlatformMac.cpp | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/gfx/thebes/gfxPlatformMac.cpp b/gfx/thebes/gfxPlatformMac.cpp
+index 04dc47c7a5..9820fc3627 100644
+--- a/gfx/thebes/gfxPlatformMac.cpp
++++ b/gfx/thebes/gfxPlatformMac.cpp
+@@ -692,6 +692,18 @@ void gfxPlatformMac::GetCommonFallbackFonts(uint32_t aCh, Script aRunScript,
+     aFontList.AppendElement("Hiragino Kaku Gothic ProN");
+   }
+ 
++#ifdef MOZ_IOS_LEGACY
++  // iOS 4-7 has none of the macOS fonts named above for CJK and Latin; these
++  // are the ones it ships.
++  aFontList.AppendElement("Helvetica");
++  aFontList.AppendElement("Heiti SC");
++  aFontList.AppendElement("Heiti TC");
++  aFontList.AppendElement("Hiragino Kaku Gothic ProN");
++  aFontList.AppendElement("Apple SD Gothic Neo");
++  aFontList.AppendElement("Heiti J");
++  aFontList.AppendElement("Heiti K");
++#endif
++
+   // Arial Unicode MS has lots of glyphs for obscure characters; try it as a
+   // last resort.
+   aFontList.AppendElement("Arial Unicode MS");
+-- 
+2.53.0
+

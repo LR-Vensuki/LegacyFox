@@ -1,0 +1,26 @@
+From 50b82b5365df5229bfaa26c4da6c21cc79199ec6 Mon Sep 17 00:00:00 2001
+From: LR-Vensuki <260785366+LR-Vensuki@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 23:39:21 +0300
+Subject: [PATCH 18/42] gfx/ycbcr: C path on armv7 iOS (GNU/ELF assembly)
+
+---
+ gfx/ycbcr/moz.build | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/gfx/ycbcr/moz.build b/gfx/ycbcr/moz.build
+index a5080c40d3..85ef29f53c 100644
+--- a/gfx/ycbcr/moz.build
++++ b/gfx/ycbcr/moz.build
+@@ -51,7 +51,8 @@ else:
+         'yuv_row_other.cpp',
+     ]
+ 
+-if CONFIG['TARGET_CPU'] == 'arm' and CONFIG['HAVE_ARM_NEON']:
++# LegacyFox: the ARM assembly here is GNU/ELF only; armv7 iOS takes the C path.
++if CONFIG['TARGET_CPU'] == 'arm' and CONFIG['HAVE_ARM_NEON'] and not CONFIG['MOZ_IOS_LEGACY']:
+     SOURCES += [
+         'yuv_row_arm.s',
+     ]
+-- 
+2.53.0
+

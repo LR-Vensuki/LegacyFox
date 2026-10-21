@@ -1,0 +1,91 @@
+From c2ee56e476a2a1b105bd5a63d3ecdf413548bca0 Mon Sep 17 00:00:00 2001
+From: LR-Vensuki <260785366+LR-Vensuki@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 23:20:35 +0300
+Subject: [PATCH 16/42] armv7 iOS 6 XUL link: xptcall underscore on Apple, NEON
+ assumed on iOS armv7, IOSurface framework and weak lookups, no
+ ChildProcessInit export
+
+---
+ build/moz.configure/arm.configure               | 10 +++++++++-
+ toolkit/library/libxul.symbols                  |  2 ++
+ toolkit/library/moz.build                       | 11 +++++++++++
+ xpcom/reflect/xptcall/md/unix/xptcstubs_arm.cpp |  2 +-
+ 4 files changed, 23 insertions(+), 2 deletions(-)
+
+diff --git a/build/moz.configure/arm.configure b/build/moz.configure/arm.configure
+index a978538c48..9d3e14d796 100644
+--- a/build/moz.configure/arm.configure
++++ b/build/moz.configure/arm.configure
+@@ -252,11 +252,19 @@ have_arm_simd = c_compiler.try_compile(
+ set_config("HAVE_ARM_SIMD", have_arm_simd)
+ set_define("HAVE_ARM_SIMD", have_arm_simd)
+ 
+-have_arm_neon = c_compiler.try_compile(
++have_arm_neon_asm = c_compiler.try_compile(
+     body='asm(".fpu neon\\n vadd.i8 d0, d0, d0");',
+     check_msg="for ARM NEON support in compiler",
+ )
+ 
++
++# LegacyFox: Apple's assembler has no .fpu directive, yet every armv7 iOS
++# device (A4 and later) has NEON and clang targets it by default.
++@depends(have_arm_neon_asm, target)
++def have_arm_neon(asm, target):
++    return asm or (target.os == "iOS" and target.cpu == "arm") or None
++
++
+ set_config("HAVE_ARM_NEON", have_arm_neon)
+ set_define("HAVE_ARM_NEON", have_arm_neon)
+ 
+diff --git a/toolkit/library/libxul.symbols b/toolkit/library/libxul.symbols
+index e63e3e7442..7bb90a1b5a 100644
+--- a/toolkit/library/libxul.symbols
++++ b/toolkit/library/libxul.symbols
+@@ -2,7 +2,9 @@ XRE_GetBootstrap
+ uprofiler_get
+ #ifdef XP_IOS
+ MainProcessInit
++#ifndef MOZ_IOS_LEGACY
+ ChildProcessInit
++#endif
+ GeckoViewOpenWindow
+ #endif
+ #ifdef ANDROID
+diff --git a/toolkit/library/moz.build b/toolkit/library/moz.build
+index 9fca10dc2b..4b996fa9b7 100644
+--- a/toolkit/library/moz.build
++++ b/toolkit/library/moz.build
+@@ -249,6 +249,17 @@ if CONFIG["MOZ_WIDGET_TOOLKIT"] == "uikit":
+         "-framework OpenGLES",
+     ]
+ 
++if CONFIG["MOZ_IOS_LEGACY"]:
++    # IOSurface is a private framework on iOS 4-7 (sdk-overlay link stub), and
++    # the calls weak-declared in sdk-overlay are looked up when loaded: absent
++    # on old iOS, they stay NULL.
++    OS_LIBS += [
++        "-framework IOSurface",
++        "-Wl,-U,_CMSampleBufferCreateReadyWithImageBuffer",
++        "-Wl,-U,_CVPixelBufferCreateWithIOSurface",
++        "-Wl,-U,_CVPixelBufferGetIOSurface",
++    ]
++
+ if CONFIG["MOZ_WMF"]:
+     OS_LIBS += [
+         "mfuuid",
+diff --git a/xpcom/reflect/xptcall/md/unix/xptcstubs_arm.cpp b/xpcom/reflect/xptcall/md/unix/xptcstubs_arm.cpp
+index a85beeb9ca..4c2ffeb1ed 100644
+--- a/xpcom/reflect/xptcall/md/unix/xptcstubs_arm.cpp
++++ b/xpcom/reflect/xptcall/md/unix/xptcstubs_arm.cpp
+@@ -143,7 +143,7 @@ __asm__ ("\n"
+          GNU(".cfi_def_cfa_offset 16\n")
+          GNU(".cfi_offset lr, -16\n")
+          "mov	r1, ip\n"
+-         "bl	PrepareAndDispatch\n"
++         "bl	" APPLE("_") "PrepareAndDispatch\n"
+          "ldr	pc, [sp], #16\n"
+          GNU(".cfi_endproc\n")
+          GNU(".fnend"));
+-- 
+2.53.0
+

@@ -1,0 +1,91 @@
+From 3565c8e8bd07ece09b023e2a4e8b51609955a5ea Mon Sep 17 00:00:00 2001
+From: LR-Vensuki <260785366+LR-Vensuki@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 09:00:39 +0300
+Subject: [PATCH 41/42] LegacyFox bridges: site icons for the shell, Sync state
+ says when it is known, first sync 30 s after start
+
+---
+ .../geckoview/GeckoViewStartup.sys.mjs         |  1 +
+ .../modules/geckoview/LegacyFoxPlaces.sys.mjs  | 18 ++++++++++++++++++
+ .../modules/geckoview/LegacyFoxSync.sys.mjs    |  8 +++++++-
+ 3 files changed, 26 insertions(+), 1 deletion(-)
+
+diff --git a/mobile/shared/components/geckoview/GeckoViewStartup.sys.mjs b/mobile/shared/components/geckoview/GeckoViewStartup.sys.mjs
+index 53116943b3..547bff75f7 100644
+--- a/mobile/shared/components/geckoview/GeckoViewStartup.sys.mjs
++++ b/mobile/shared/components/geckoview/GeckoViewStartup.sys.mjs
+@@ -149,6 +149,7 @@ export class GeckoViewStartup {
+               "LegacyFox:Places:RemoveBookmark",
+               "LegacyFox:Places:RemoveHistory",
+               "LegacyFox:Places:ClearHistory",
++              "LegacyFox:Places:Favicons",
+             ],
+           });
+           GeckoViewUtils.addLazyGetter(this, "LegacyFoxSync", {
+diff --git a/mobile/shared/modules/geckoview/LegacyFoxPlaces.sys.mjs b/mobile/shared/modules/geckoview/LegacyFoxPlaces.sys.mjs
+index 703fb609b4..f5f331efca 100644
+--- a/mobile/shared/modules/geckoview/LegacyFoxPlaces.sys.mjs
++++ b/mobile/shared/modules/geckoview/LegacyFoxPlaces.sys.mjs
+@@ -139,6 +139,24 @@ export const LegacyFoxPlaces = {
+           await lazy.PlacesUtils.history.clear();
+           aCallback.onSuccess(true);
+           break;
++        case "LegacyFox:Places:Favicons": {
++          // Site icons for the shell's lists: { url: "data:..." }, 32 px
++          // where there is a choice (Firefox for Android's list icons).
++          const icons = {};
++          for (const url of aData?.urls ?? []) {
++            try {
++              const icon = await lazy.PlacesUtils.favicons.getFaviconForPage(
++                Services.io.newURI(url),
++                aData?.size ?? 32
++              );
++              if (icon?.dataURI) {
++                icons[url] = icon.dataURI.spec;
++              }
++            } catch (e) {}
++          }
++          aCallback.onSuccess(icons);
++          break;
++        }
+       }
+     } catch (e) {
+       warn`${aEvent}: ${e}`;
+diff --git a/mobile/shared/modules/geckoview/LegacyFoxSync.sys.mjs b/mobile/shared/modules/geckoview/LegacyFoxSync.sys.mjs
+index a854bb4eb5..59863ffe37 100644
+--- a/mobile/shared/modules/geckoview/LegacyFoxSync.sys.mjs
++++ b/mobile/shared/modules/geckoview/LegacyFoxSync.sys.mjs
+@@ -12,6 +12,7 @@ import { GeckoViewUtils } from "resource://gre/modules/GeckoViewUtils.sys.mjs";
+ const lazy = {};
+ 
+ ChromeUtils.defineESModuleGetters(lazy, {
++  setTimeout: "resource://gre/modules/Timer.sys.mjs",
+   EnsureFxAccountsWebChannel: "resource://gre/modules/FxAccountsWebChannel.sys.mjs",
+   FxAccountsConfig: "resource://gre/modules/FxAccountsConfig.sys.mjs",
+   UIState: "resource://services-sync/UIState.sys.mjs",
+@@ -40,9 +41,12 @@ function startSync() {
+   try {
+     const weave = Cc["@mozilla.org/weave/service;1"].getService().wrappedJSObject;
+     weave.init();
++    // The first sync waits half a minute: right after start it competes
++    // with the first page for the one core and Places, and lists take
++    // seconds to come back meanwhile.
+     weave.whenLoaded().then(() => {
+       if (weave.enabled) {
+-        lazy.Weave.Service.scheduler.autoConnect();
++        lazy.setTimeout(() => lazy.Weave.Service.scheduler.autoConnect(), 30000);
+       }
+     });
+   } catch (e) {
+@@ -53,6 +57,8 @@ function startSync() {
+ function state() {
+   const s = lazy.UIState.get();
+   return {
++    // Until UIState has read the account, it says "not_configured".
++    ready: lazy.UIState.isReady(),
+     status: s.status,
+     email: s.email ?? null,
+     displayName: s.displayName ?? null,
+-- 
+2.53.0
+

@@ -1,0 +1,51 @@
+From 9381660db27949915046bf0ec81e9438b692c664 Mon Sep 17 00:00:00 2001
+From: LR-Vensuki <260785366+LR-Vensuki@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 23:01:19 +0300
+Subject: [PATCH 01/42] Build system: armv7 iOS against the 6.1 SDK, Rust
+ through LegacyFox's own target
+
+---
+ build/moz.configure/rust.configure      | 6 ++++++
+ build/moz.configure/toolchain.configure | 7 +++++--
+ 2 files changed, 11 insertions(+), 2 deletions(-)
+
+diff --git a/build/moz.configure/rust.configure b/build/moz.configure/rust.configure
+index aad2cbd379..cf6006b2b6 100644
+--- a/build/moz.configure/rust.configure
++++ b/build/moz.configure/rust.configure
+@@ -544,6 +544,12 @@ def rust_host_triple(
+ def rust_target_triple(
+     rustc, target, compiler_info, rust_supported_targets, arm_target
+ ):
++    # LegacyFox: rustc has no armv7-apple-ios any more. Our own target spec
++    # (armv7s-apple-ios brought down to the A4) is found by name through
++    # RUST_TARGET_PATH, and its std is built from source with -Z build-std,
++    # so plain rustc has no std to run the compile check with.
++    if target.os == "iOS" and target.cpu == "arm":
++        return "armv7-apple-ios-legacy"
+     rustc_target = detect_rustc_target(
+         target, compiler_info, arm_target, rust_supported_targets
+     )
+diff --git a/build/moz.configure/toolchain.configure b/build/moz.configure/toolchain.configure
+index 7939243559..9148e9bf9e 100644
+--- a/build/moz.configure/toolchain.configure
++++ b/build/moz.configure/toolchain.configure
+@@ -434,10 +434,13 @@ with only_when(target_is_ios):
+                 "Cannot check whether the iOS SDK is for the right target, "
+                 "assuming it is."
+             )
+-        if version < Version(ios_sdk_min_version()):
++        # 32-bit ARM (armv7, iOS 4-7) builds against the last SDKs that
++        # still carry it; the newer iOS APIs come from no SDK at all there.
++        min_version = "6.1" if target.cpu == "arm" else ios_sdk_min_version()
++        if version < Version(min_version):
+             die(
+                 'SDK version "%s" is too old. Please upgrade to at least %s. Try '
+-                "updating your system Xcode." % (version, ios_sdk_min_version())
++                "updating your system Xcode." % (version, min_version)
+             )
+         return sdk
+ 
+-- 
+2.53.0
+

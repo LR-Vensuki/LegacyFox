@@ -1,0 +1,11 @@
+Package: com.legacyreborn.legacyfox
+Name: LegacyFox
+Version: 1.0.0~beta1
+Architecture: iphoneos-arm
+Description: Unstable beta. A browser on the Firefox engine (Gecko) for iOS 5-7 on A4-A6 devices.
+Maintainer: LegacyReborn Project
+Author: LegacyReborn Project
+Section: Networking
+Priority: optional
+Depends: firmware (>= 5.0)
+Tag: role::enduser, purpose::uikit

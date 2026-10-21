@@ -1,0 +1,14 @@
+build/
+/.stage/
+/packages/
+/engine/firefox/
+*.o
+.DS_Store
+target/
+/tools/rust/hello/hello-armv7
+Cargo.lock
+/tools/cxx/hello-cxx-armv7
+*.o
+/tools/crashlog/crashlog.dylib
+# device screenshots with personal data
+/docs/screenshots/
