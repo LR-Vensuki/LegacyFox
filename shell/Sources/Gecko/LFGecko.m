@@ -257,6 +257,9 @@ static NSString* LFErrorPage(NSDictionary* m) {
     return result;
 }
 
+// The User-Agent for pages (nil: Gecko's own), see +setUserAgent:.
+static NSString* sUserAgent;
+
 @implementation LFGeckoSession
 
 @synthesize delegate = _delegate;
@@ -404,6 +407,7 @@ static NSString* LFErrorPage(NSDictionary* m) {
         nil];
     NSDictionary* init = [NSDictionary dictionaryWithObjectsAndKeys:
         settings, @"settings", modules, @"modules", nil];
+    [settings setObject:sUserAgent ? (id)sUserAgent : (id)[NSNull null] forKey:@"userAgentOverride"];
     [_settings release];
     _settings = [settings retain];
     _window = [GeckoViewOpenWindow(windowId, _dispatcher, init, _privateMode) retain];
@@ -453,8 +457,37 @@ static NSString* LFErrorPage(NSDictionary* m) {
     // GeckoView's USER_AGENT_MODE_DESKTOP and VIEWPORT_MODE_DESKTOP are 1.
     [_settings setObject:[NSNumber numberWithInt:desktop ? 1 : 0] forKey:@"userAgentMode"];
     [_settings setObject:[NSNumber numberWithInt:desktop ? 1 : 0] forKey:@"viewportMode"];
+    [_settings setObject:[self userAgentOverride] forKey:@"userAgentOverride"];
     [_dispatcher dispatch:@"GeckoView:UpdateSettings" message:_settings];
     [self reload];
+}
+
++ (void)setUserAgent:(NSString*)agent {
+    [sUserAgent release];
+    sUserAgent = [agent copy];
+}
+
+// The override wins over GeckoView's desktop mode: desktop pages get the
+// desktop agent instead.
+- (id)userAgentOverride {
+    return [self desktopMode] || !sUserAgent ? (id)[NSNull null] : sUserAgent;
+}
+
+- (void)applyUserAgent {
+    [_settings setObject:[self userAgentOverride] forKey:@"userAgentOverride"];
+    if (_window)
+        [_dispatcher dispatch:@"GeckoView:UpdateSettings" message:_settings];
+}
+
+- (void)scrollByScreens:(float)screens {
+    [_dispatcher dispatch:@"GeckoView:ScrollBy"
+                  message:[NSDictionary dictionaryWithObjectsAndKeys:
+                               [NSNumber numberWithFloat:0], @"widthValue",
+                               [NSNumber numberWithInt:0], @"widthType",
+                               [NSNumber numberWithFloat:screens], @"heightValue",
+                               [NSNumber numberWithInt:2], @"heightType",  // visual viewport heights
+                               [NSNumber numberWithInt:0], @"behavior",    // smooth
+                               nil]];
 }
 
 - (void)find:(NSString*)text backwards:(BOOL)backwards reply:(LFReply)reply {

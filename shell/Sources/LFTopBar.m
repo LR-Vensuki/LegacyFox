@@ -82,7 +82,9 @@ static void LFClearToolbar(UIToolbar *bar) {
         [_field setTextColor:[UIColor colorWithWhite:0.15 alpha:1]];
         [_field setContentVerticalAlignment:UIControlContentVerticalAlignmentCenter];
         [_field setPlaceholder:@"Введите поиск или адрес"];
-        [_field setKeyboardType:UIKeyboardTypeURL];
+        // The ordinary keyboard: searches need its space bar (the web
+        // search keyboard came only with iOS 7).
+        [_field setKeyboardType:UIKeyboardTypeDefault];
         [_field setAutocapitalizationType:UITextAutocapitalizationTypeNone];
         [_field setAutocorrectionType:UITextAutocorrectionTypeNo];
         [_field setReturnKeyType:UIReturnKeyGo];

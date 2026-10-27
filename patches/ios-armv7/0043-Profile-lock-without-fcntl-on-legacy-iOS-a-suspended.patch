@@ -1,0 +1,31 @@
+From 17240108aa2bd86ff735d1fa0e5517a18982dc58 Mon Sep 17 00:00:00 2001
+From: LR-Vensuki <260785366+LR-Vensuki@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 18:36:35 +0300
+Subject: [PATCH] Profile lock without fcntl on legacy iOS: a suspended app
+ holding a file lock is killed (0xdead10cc)
+
+---
+ toolkit/profile/nsProfileLock.cpp | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/toolkit/profile/nsProfileLock.cpp b/toolkit/profile/nsProfileLock.cpp
+index 3d17171117..9ef8715b68 100644
+--- a/toolkit/profile/nsProfileLock.cpp
++++ b/toolkit/profile/nsProfileLock.cpp
+@@ -456,7 +456,12 @@ nsresult nsProfileLock::Lock(nsIFile* aProfileDir,
+   rv = lockFile->Clone(getter_AddRefs(mLockFile));
+   if (NS_FAILED(rv)) return rv;
+ 
+-#if defined(XP_DARWIN)
++#if defined(MOZ_IOS_LEGACY)
++  // iOS kills an app that is suspended while holding a file lock
++  // (0xdead10cc), which a locked screen or the home button does: the
++  // profile is marked with the symlink alone, which holds nothing.
++  rv = LockWithSymlink(lockFile, false);
++#elif defined(XP_DARWIN)
+   // First, try locking using fcntl. It is more reliable on
+   // a local machine, but may not be supported by an NFS server.
+ 
+-- 
+2.53.0
+

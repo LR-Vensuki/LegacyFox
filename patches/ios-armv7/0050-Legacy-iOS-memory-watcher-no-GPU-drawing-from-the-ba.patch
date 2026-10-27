@@ -1,0 +1,368 @@
+From 6c51d37726ede8a0b619b1ba49c45e8ac7fc34ad Mon Sep 17 00:00:00 2001
+From: LR-Vensuki <260785366+LR-Vensuki@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 18:27:02 +0300
+Subject: [PATCH] Legacy iOS: memory watcher, no GPU drawing from the
+ background
+
+Every 2 s a background thread measures the free address space below the
+shared cache and iOS's memory level (kern.memorystatus_level). When
+either gets low Gecko gets memory pressure; near the point where iOS
+kills the app, or the GPU driver finds no hole for its 16 MB blocks,
+the embedding app is told (LegacyFoxMemoryCritical).
+
+iOS kills an app that sends the GPU commands from the background: the
+SWGL GPU path pauses there, and entering the background waits for a
+frame already begun.
+
+LF_SWGL_GPU_STATS also logs frame rate, drawing time and pixels drawn
+every 2 s, malloc zones, and GPU textures of 8 MB or more.
+---
+ .../RenderCompositorNative.cpp                |  78 +++++++++++
+ .../RenderCompositorNative.h                  |  19 +++
+ gfx/wr/swgl/src/gpu_gles2.h                   |   5 +
+ widget/uikit/nsAppShell.mm                    | 127 ++++++++++++++++++
+ 4 files changed, 229 insertions(+)
+
+diff --git a/gfx/webrender_bindings/RenderCompositorNative.cpp b/gfx/webrender_bindings/RenderCompositorNative.cpp
+index 83b2b63990..73ec2eab48 100644
+--- a/gfx/webrender_bindings/RenderCompositorNative.cpp
++++ b/gfx/webrender_bindings/RenderCompositorNative.cpp
+@@ -23,7 +23,10 @@
+ #if defined(MOZ_IOS_LEGACY)
+ #  include "mozilla/layers/NativeLayerCA.h"
+ #  include "RenderCompositorSWGLGPU.h"
++#  include "mozilla/Monitor.h"
+ #  include <mach/mach.h>
++#  include <malloc/malloc.h>
++#  include <memory>
+ #endif
+ 
+ namespace mozilla::wr {
+@@ -670,9 +673,45 @@ RenderCompositorNativeSWGL::~RenderCompositorNativeSWGL() {
+ #endif
+ }
+ 
++#if defined(MOZ_IOS_LEGACY)
++static Atomic<bool> sAppInBackground(false);
++
++void SetLegacyAppInBackground(bool aBackground) {
++  MOZ_ASSERT(NS_IsMainThread());
++  sAppInBackground = aBackground;
++  nsCOMPtr<nsIThread> thread = RenderThread::GetRenderThread();
++  if (!aBackground || !thread) {
++    return;
++  }
++  struct Done {
++    Monitor mMonitor{"SetLegacyAppInBackground"};
++    bool mDone MOZ_GUARDED_BY(mMonitor) = false;
++  };
++  auto done = std::make_shared<Done>();
++  thread->Dispatch(NS_NewRunnableFunction("SetLegacyAppInBackground", [done] {
++    MonitorAutoLock lock(done->mMonitor);
++    done->mDone = true;
++    lock.Notify();
++  }));
++  MonitorAutoLock lock(done->mMonitor);
++  TimeStamp end = TimeStamp::Now() + TimeDuration::FromSeconds(2);
++  while (!done->mDone && TimeStamp::Now() < end) {
++    lock.Wait(end - TimeStamp::Now());
++  }
++}
++
++// Only the GPU path stops: the CPU one keeps drawing behind the lock screen,
++// for the developer runs that start the app there.
++bool RenderCompositorNativeSWGL::IsPaused() { return mGpu && sAppInBackground; }
++#endif
++
+ bool RenderCompositorNativeSWGL::MakeCurrent() {
+   wr_swgl_make_current(mContext);
+ #if defined(MOZ_IOS_LEGACY)
++  if (mGpu && sAppInBackground) {
++    // Not even texture uploads: they would reach the GPU too.
++    return false;
++  }
+   if (mGpu && SwglGpuEAGLMakeCurrent(mGpu) && !mGpuAttached) {
+     mGpuAttached = SwglGpuAttach(mGpu);
+     char describe[256];
+@@ -700,6 +739,27 @@ void RenderCompositorNativeSWGL::DoFlush() {
+   // LF_SWGL_GPU_STATS=1: the GPU path's counters and the process's memory
+   // every 10 frames.
+   static const bool stats = getenv("LF_SWGL_GPU_STATS");
++  if (stats) {
++    TimeStamp now = TimeStamp::Now();
++    if (mStatsStart.IsNull()) {
++      mStatsStart = now;
++    }
++    mStatsFrames++;
++    mStatsDrawingMs += (now - mBeginFrameTimeStamp).ToMilliseconds();
++    double elapsed = (now - mStatsStart).ToMilliseconds();
++    if (elapsed >= 2000) {
++      printf_stderr(
++          "LegacyFox: %u frames in %.0f ms (%.1f fps), drawing %.0f ms (%.0f "
++          "ms a frame), %.1f Mpx drawn\n",
++          mStatsFrames, elapsed, mStatsFrames * 1000 / elapsed,
++          mStatsDrawingMs, mStatsDrawingMs / mStatsFrames,
++          mStatsPixels / 1e6);
++      mStatsStart = now;
++      mStatsFrames = 0;
++      mStatsDrawingMs = 0;
++      mStatsPixels = 0;
++    }
++  }
+   if (stats && ++mGpuFrames % (mGpuAttached ? 1 : 10) == 0) {
+     uint32_t s[8], m[5];
+     task_basic_info_data_t info = {};
+@@ -772,6 +832,23 @@ void RenderCompositorNativeSWGL::LogAddressSpace() {
+   }
+   printf_stderr("%s\n", line.get());
+   printf_stderr("LegacyFox: regions of 8 MB or more:%s\n", large.get());
++  // Who holds malloc's regions: the system's zones, by name.
++  vm_address_t* zones = nullptr;
++  unsigned zoneCount = 0;
++  nsCString zoneLine;
++  if (malloc_get_all_zones(mach_task_self(), nullptr, &zones, &zoneCount) ==
++      KERN_SUCCESS) {
++    for (unsigned i = 0; i < zoneCount; i++) {
++      auto* zone = reinterpret_cast<malloc_zone_t*>(zones[i]);
++      malloc_statistics_t st = {};
++      malloc_zone_statistics(zone, &st);
++      zoneLine.AppendPrintf(" %s=%u/%u", zone->zone_name ? zone->zone_name : "?",
++                            unsigned(st.size_allocated >> 20),
++                            unsigned(st.size_in_use >> 20));
++    }
++  }
++  printf_stderr("LegacyFox: malloc zones (MB reserved/in use):%s\n",
++                zoneLine.get());
+ }
+ #endif
+ 
+@@ -845,6 +922,7 @@ bool RenderCompositorNativeSWGL::MapTile(wr::NativeTileId aId,
+                          aValidRect.height());
+   BindNativeLayer(aId, dirtyRect);
+ #if defined(MOZ_IOS_LEGACY)
++  mStatsPixels += dirtyRect.Area();
+   if (mGpuAttached && mCurrentlyBoundNativeLayer->AsNativeLayerCA()) {
+     CFTypeRefPtr<IOSurfaceRef> surface =
+         mCurrentlyBoundNativeLayer->AsNativeLayerCA()->NextSurfaceAsIOSurface(
+diff --git a/gfx/webrender_bindings/RenderCompositorNative.h b/gfx/webrender_bindings/RenderCompositorNative.h
+index 4f91a6afe9..8a8f4e95e1 100644
+--- a/gfx/webrender_bindings/RenderCompositorNative.h
++++ b/gfx/webrender_bindings/RenderCompositorNative.h
+@@ -201,6 +201,13 @@ class RenderCompositorNativeOGL : public RenderCompositorNative {
+ 
+ // RenderCompositorNativeSWGL is a NativeLayer compositor that only
+ // deals with mapping the underlying buffer for SWGL usage of a tile.
++#if defined(MOZ_IOS_LEGACY)
++// Main thread, when the app goes to the background or comes back. iOS kills
++// an app that sends the GPU commands from the background, so GPU drawing
++// stops there, and this returns once a frame begun before is done.
++void SetLegacyAppInBackground(bool aBackground);
++#endif
++
+ class RenderCompositorNativeSWGL : public RenderCompositorNative {
+  public:
+   static UniquePtr<RenderCompositor> Create(
+@@ -216,6 +223,12 @@ class RenderCompositorNativeSWGL : public RenderCompositorNative {
+ 
+   void CancelFrame() override;
+ 
++#if defined(MOZ_IOS_LEGACY)
++  // No GPU frames while the app is in the background
++  // (SetLegacyAppInBackground).
++  bool IsPaused() override;
++#endif
++
+   layers::WebRenderBackend BackendType() const override {
+     return layers::WebRenderBackend::SOFTWARE;
+   }
+@@ -254,6 +267,12 @@ class RenderCompositorNativeSWGL : public RenderCompositorNative {
+     int32_t height;
+   } mGpuTile = {};
+   uint32_t mGpuFrames = 0;
++  // LF_SWGL_GPU_STATS: frames, time spent drawing them and pixels drawn
++  // since mStatsStart, logged every 2 s.
++  TimeStamp mStatsStart;
++  uint32_t mStatsFrames = 0;
++  double mStatsDrawingMs = 0;
++  uint64_t mStatsPixels = 0;
+ #endif
+   RefPtr<gfx::DrawTarget> mLayerTarget;
+   uint8_t* mLayerData = nullptr;
+diff --git a/gfx/wr/swgl/src/gpu_gles2.h b/gfx/wr/swgl/src/gpu_gles2.h
+index 5c3c0d1a67..3ec8a81825 100644
+--- a/gfx/wr/swgl/src/gpu_gles2.h
++++ b/gfx/wr/swgl/src/gpu_gles2.h
+@@ -513,6 +513,11 @@ static bool ensure_resource(GpuBackend* g, Texture& t, int min_w = 0,
+   gt.tex_h = want_h;
+   gt.gpu_size = texel_bytes(t.internal_format, gt.expanded, want_w, want_h);
+   gpu_tex_bytes += gt.gpu_size;
++  static const bool stats = getenv("LF_SWGL_GPU_STATS");
++  if (stats && gt.gpu_size >= (8 << 20)) {
++    fprintf(stderr, "gpu: %dx%d texture, format %x: %d MB\n", want_w, want_h,
++            t.internal_format, int(gt.gpu_size >> 20));
++  }
+   gt.gpu_newer = false;
+   gt.cpu_newer = !gt.resident;
+   return true;
+diff --git a/widget/uikit/nsAppShell.mm b/widget/uikit/nsAppShell.mm
+index ceef771a0f..656e8a7c3a 100644
+--- a/widget/uikit/nsAppShell.mm
++++ b/widget/uikit/nsAppShell.mm
+@@ -43,6 +43,115 @@ nsAppShell* nsAppShell::gAppShell = NULL;
+ 
+ static void ApplicationWillTerminate(bool aCallExit);
+ 
++#if defined(MOZ_IOS_LEGACY)
++#  include <dispatch/dispatch.h>
++#  include <mach/mach.h>
++#  include <sys/sysctl.h>
++#  include <algorithm>
++#  include "mozilla/TimeStamp.h"
++
++namespace mozilla::wr {
++void SetLegacyAppInBackground(bool aBackground);
++}
++
++// A 32-bit iOS 4-7 app has the 768 MB below the shared cache (0x30000000)
++// for itself. Long before memory runs out, malloc or the GPU driver find no
++// hole for a large block there and the app crashes ("can't allocate
++// region"). Every 2 s a background thread measures the free part; when it
++// gets small, or the memory iOS has left for all apps does (it kills the
++// app in front without a warning when that runs out), Gecko is told memory
++// is low (caches, JIT code and empty GC chunks go back), and that it is fine
++// again once there is room. With almost nothing left the embedding app is
++// told (LegacyFoxMemoryCritical): it can drop the page before iOS kills it.
++static void WatchAddressSpace() {
++  static dispatch_source_t timer = dispatch_source_create(
++      DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
++      dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_LOW, 0));
++  static bool low = false;
++  static TimeStamp lowSince, criticalSince;
++  dispatch_source_set_timer(timer,
++                            dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
++                            2 * NSEC_PER_SEC, NSEC_PER_SEC / 2);
++  dispatch_source_set_event_handler(timer, ^{
++    const vm_address_t end = 0x30000000;
++    vm_address_t address = 0;
++    vm_size_t free = 0, largest = 0;
++    while (address < end) {
++      vm_address_t region = address;
++      vm_size_t size = 0;
++      natural_t depth = 0;
++      vm_region_submap_info_data_64_t info;
++      mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
++      if (vm_region_recurse_64(mach_task_self(), &region, &size, &depth,
++                               (vm_region_info_64_t)&info,
++                               &count) != KERN_SUCCESS ||
++          region > end) {
++        region = end;
++        size = 0;
++      }
++      if (region > address) {
++        free += region - address;
++        largest = std::max(largest, region - address);
++      }
++      if (!size) {
++        break;
++      }
++      address = region + size;
++    }
++    // The share of memory iOS has left, in percent.
++    int level = 100;
++    size_t len = sizeof(level);
++    sysctlbyname("kern.memorystatus_level", &level, &len, nullptr, 0);
++    static int loggedLevel = 0;
++    static const bool stats = getenv("LF_SWGL_GPU_STATS");
++    if (stats && std::abs(level - loggedLevel) >= 3) {
++      fprintf(stderr, "LegacyFox: memory level %d%%, address space %u MB free\n",
++              level, unsigned(free >> 20));
++      loggedLevel = level;
++    }
++    TimeStamp now = TimeStamp::Now();
++    bool tight =
++        free < (112u << 20) || largest < (40u << 20) || level < 20;
++    bool roomy =
++        free > (160u << 20) && largest > (64u << 20) && level > 30;
++    // Again every 30 s while it stays tight, every 10 s near the end.
++    if (tight &&
++        (!low || (now - lowSince).ToSeconds() > (level < 12 ? 10 : 30))) {
++      fprintf(stderr,
++              "LegacyFox: memory low: address space %u MB free, largest hole "
++              "%u MB, memory level %d%%\n",
++              unsigned(free >> 20), unsigned(largest >> 20), level);
++      low = true;
++      lowSince = now;
++      NS_NotifyOfMemoryPressure(MemoryPressureState::LowMemory);
++    } else if (low && roomy) {
++      fprintf(stderr, "LegacyFox: memory fine again: %u MB free, level %d%%\n",
++              unsigned(free >> 20), level);
++      low = false;
++      NS_NotifyOfMemoryPressure(MemoryPressureState::NoPressure);
++    }
++    // iOS sends its last warning near 10% and kills a few points lower; the
++    // GPU driver crashes once it finds no hole for its 16 MB blocks.
++    bool critical =
++        level <= 10 || free < (64u << 20) || largest < (24u << 20);
++    if (critical &&
++        (criticalSince.IsNull() || (now - criticalSince).ToSeconds() > 20)) {
++      fprintf(stderr,
++              "LegacyFox: memory critical: level %d%%, address space %u MB "
++              "free, largest hole %u MB\n",
++              level, unsigned(free >> 20), unsigned(largest >> 20));
++      criticalSince = now;
++      dispatch_async(dispatch_get_main_queue(), ^{
++        [[NSNotificationCenter defaultCenter]
++            postNotificationName:@"LegacyFoxMemoryCritical"
++                          object:nil];
++      });
++    }
++  });
++  dispatch_resume(timer);
++}
++#endif
++
+ // AppShellDelegate
+ //
+ // Acts as a delegate for the UIApplication
+@@ -65,6 +174,9 @@ static void ApplicationWillTerminate(bool aCallExit);
+       postNotificationName:@"GeckoAppShellDidFinishLaunching"
+                     object:application
+                   userInfo:launchOptions];
++  // Started behind the lock screen: no drawing until it is in front.
++  wr::SetLegacyAppInBackground([application applicationState] ==
++                               UIApplicationStateBackground);
+ #endif
+ 
+   return YES;
+@@ -83,6 +195,18 @@ static void ApplicationWillTerminate(bool aCallExit);
+   ALOG("[AppShellDelegate applicationWillResignActive:]");
+ }
+ 
++#if defined(MOZ_IOS_LEGACY)
++- (void)applicationDidEnterBackground:(UIApplication*)application {
++  ALOG("[AppShellDelegate applicationDidEnterBackground:]");
++  wr::SetLegacyAppInBackground(true);
++}
++
++- (void)applicationWillEnterForeground:(UIApplication*)application {
++  ALOG("[AppShellDelegate applicationWillEnterForeground:]");
++  wr::SetLegacyAppInBackground(false);
++}
++#endif
++
+ - (void)applicationDidReceiveMemoryWarning:(UIApplication*)application {
+   ALOG("[AppShellDelegate applicationDidReceiveMemoryWarning:]");
+   NS_NotifyOfMemoryPressure(MemoryPressureState::LowMemory);
+@@ -162,6 +286,9 @@ nsresult nsAppShell::Init() {
+   }
+ 
+   nsresult rv = nsBaseAppShell::Init();
++#if defined(MOZ_IOS_LEGACY)
++  WatchAddressSpace();
++#endif
+ 
+   nsCOMPtr<nsIObserverService> obsServ =
+       mozilla::services::GetObserverService();
+-- 
+2.53.0
+

@@ -1,0 +1,97 @@
+From b3722ca36108f7d867e9df02350ee4c649f7dbc9 Mon Sep 17 00:00:00 2001
+From: LR-Vensuki <260785366+LR-Vensuki@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 18:27:01 +0300
+Subject: [PATCH] Legacy iOS fonts: no CoreText search through every installed
+ font
+
+For a character no font of the cascade list has (a ruble sign before
+iOS 8), CTFontCreateForString opened every font file and CoreText kept
+them all mapped: 120 MB of the 768 MB address space a 32-bit app has.
+The common fallback list names the fonts iOS 4-7 ships instead: Arial
+and Times New Roman for Latin, Cyrillic and Greek, Arial Hebrew, the
+Sangam MN fonts, Zapf Dingbats and Hiragino Kaku Gothic for symbols.
+---
+ gfx/thebes/CoreTextFontList.cpp |  7 +++++++
+ gfx/thebes/gfxPlatformMac.cpp   | 31 +++++++++++++++++++++++++++++--
+ 2 files changed, 36 insertions(+), 2 deletions(-)
+
+diff --git a/gfx/thebes/CoreTextFontList.cpp b/gfx/thebes/CoreTextFontList.cpp
+index bbd955d9fc..2f16bbb919 100644
+--- a/gfx/thebes/CoreTextFontList.cpp
++++ b/gfx/thebes/CoreTextFontList.cpp
+@@ -1325,6 +1325,13 @@ gfxFontEntry* CoreTextFontList::PlatformGlobalFontFallback(
+     FontVisibilityProvider* aFontVisibilityProvider, const uint32_t aCh,
+     Script aRunScript, const gfxFontStyle* aMatchStyle,
+     FontFamily& aMatchedFamily) {
++#ifdef MOZ_IOS_LEGACY
++  // For a character that no font of the cascade list has (a ruble sign
++  // before iOS 8), CTFontCreateForString opens every installed font, and
++  // CoreText keeps them all mapped: 120 MB of the app's 768 MB. The common
++  // fallback list already named the fonts iOS ships for each script.
++  return nullptr;
++#endif
+   CFStringRef str;
+   UniChar ch[2];
+   CFIndex length = 1;
+diff --git a/gfx/thebes/gfxPlatformMac.cpp b/gfx/thebes/gfxPlatformMac.cpp
+index 4152e1f334..61a1f48e94 100644
+--- a/gfx/thebes/gfxPlatformMac.cpp
++++ b/gfx/thebes/gfxPlatformMac.cpp
+@@ -677,10 +677,12 @@ void gfxPlatformMac::GetCommonFallbackFonts(uint32_t aCh, Script aRunScript,
+   // surrounding script run. So we'll always append a couple of likely fonts
+   // for such characters.
+   const uint32_t b = aCh >> 8;
+-  if (aRunScript == Script::COMMON ||  // Stray COMMON chars not resolved
++  const bool symbol =
++      aRunScript == Script::COMMON ||  // Stray COMMON chars not resolved
+       (b >= 0x20 && b <= 0x2b) || b == 0x2e ||  // BMP symbols/punctuation/etc
+       GetGenCategory(aCh) == nsUGenCategory::kSymbol ||
+-      GetGenCategory(aCh) == nsUGenCategory::kPunctuation) {
++      GetGenCategory(aCh) == nsUGenCategory::kPunctuation;
++  if (symbol) {
+     if (b == 0x27) {
+       aFontList.AppendElement("Zapf Dingbats");
+     }
+@@ -698,7 +700,27 @@ void gfxPlatformMac::GetCommonFallbackFonts(uint32_t aCh, Script aRunScript,
+   // iOS 4-7 has none of the macOS fonts named above for CJK and Latin; these
+   // are the ones it ships. CJK fonts only for CJK text and punctuation: each
+   // one tried maps 10-28 MB of font file into the app's address space.
++  // There is no system-wide search after this list (see
++  // CoreTextFontList::PlatformGlobalFontFallback).
+   aFontList.AppendElement("Helvetica");
++  aFontList.AppendElement("Arial");
++  aFontList.AppendElement("Times New Roman");
++  switch (aRunScript) {
++    case Script::HEBREW:
++      aFontList.AppendElement("Arial Hebrew");
++      break;
++    case Script::KANNADA:
++      aFontList.AppendElement("Kannada Sangam MN");
++      break;
++    case Script::TAMIL:
++      aFontList.AppendElement("Tamil Sangam MN");
++      break;
++    case Script::TELUGU:
++      aFontList.AppendElement("Telugu Sangam MN");
++      break;
++    default:
++      break;
++  }
+   if ((b >= 0x2e && b <= 0x9f) || (b >= 0xac && b <= 0xd7) ||
+       (b >= 0xf9 && b <= 0xff) || aCh >= 0x20000) {
+     aFontList.AppendElement("Heiti SC");
+@@ -707,6 +729,11 @@ void gfxPlatformMac::GetCommonFallbackFonts(uint32_t aCh, Script aRunScript,
+     aFontList.AppendElement("Apple SD Gothic Neo");
+     aFontList.AppendElement("Heiti J");
+     aFontList.AppendElement("Heiti K");
++  } else if (symbol) {
++    // Arrows, shapes, stars, box drawing: Zapf Dingbats is small, and the
++    // 7 MB Hiragino Kaku Gothic has nearly all the rest.
++    aFontList.AppendElement("Zapf Dingbats");
++    aFontList.AppendElement("Hiragino Kaku Gothic ProN");
+   }
+ #endif
+ 
+-- 
+2.53.0
+

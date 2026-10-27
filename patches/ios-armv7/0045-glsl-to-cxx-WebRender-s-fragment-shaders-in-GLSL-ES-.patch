@@ -1,0 +1,994 @@
+From 4406dd2fbc9af0b5c5c36560b587b00f5e4bede3 Mon Sep 17 00:00:00 2001
+From: LR-Vensuki <260785366+LR-Vensuki@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 23:16:29 +0300
+Subject: [PATCH] glsl-to-cxx: WebRender's fragment shaders in GLSL ES 1.0 for
+ OpenGL ES 2
+
+The 9_3 translator writes a second dialect for GPUs such as the PowerVR
+SGX of A4-A6 iOS devices: GLSL ES spelling, integer common functions
+through floats, arrays copied element by element, vector conditions
+through mix. swgl's build embeds the source on iOS (or with SWGL_ESSL=1).
+All 71 GPU variants compile and link on an iPhone 4S; ps_text_run's
+variants still fail in glsl-to-cxx and stay on the CPU.
+---
+ gfx/wr/glsl-to-cxx/src/hlsl.rs | 458 +++++++++++++++++++++++++++++----
+ gfx/wr/glsl-to-cxx/src/lib.rs  |  14 +-
+ gfx/wr/glsl-to-cxx/src/main.rs |   9 +-
+ gfx/wr/swgl/build.rs           |  87 ++++++-
+ gfx/wr/swgl/src/glsl.h         |   7 +
+ 5 files changed, 516 insertions(+), 59 deletions(-)
+
+diff --git a/gfx/wr/glsl-to-cxx/src/hlsl.rs b/gfx/wr/glsl-to-cxx/src/hlsl.rs
+index 34cc8ebdb0..27915ad782 100644
+--- a/gfx/wr/glsl-to-cxx/src/hlsl.rs
++++ b/gfx/wr/glsl-to-cxx/src/hlsl.rs
+@@ -26,6 +26,11 @@
+ //! reading SV_Position (gl_FragCoord arrives as a varying), no SampleLevel
+ //! (texelFetch samples at the texel's centre), and GL's bottom-up rows (the
+ //! vertex stage flips Y so that memory layout matches SWGL's exactly).
++//!
++//! The same translation also writes GLSL ES 1.0 (`essl`), for OpenGL ES 2
++//! GPUs that lack vertex texture fetch, such as the PowerVR SGX in iOS
++//! devices of the A4-A6 generation. Their limits are much like 9_3's; the
++//! differences are spelling, and that GL's rows need no flipping.
+ 
+ use crate::hir;
+ use glsl::syntax;
+@@ -113,6 +118,29 @@ struct Emitter<'a> {
+     flat_names: HashSet<String>,
+     local_inits: HashMap<hir::SymRef, hir::Expr>,
+     accepts: Vec<String>,
++    /// GLSL ES 1.0 instead of HLSL.
++    essl: bool,
++}
++
++/// An HLSL type name as GLSL ES 1.0 spells it.
++fn essl_type(t: &str) -> String {
++    let base = |b: &str| match b {
++        "float" => "vec",
++        "int" => "ivec",
++        "bool" => "bvec",
++        _ => "",
++    };
++    for b in ["float", "int", "bool"] {
++        if let Some(rest) = t.strip_prefix(b) {
++            if rest.len() == 1 && rest.chars().all(|c| ('2'..='4').contains(&c)) {
++                return format!("{}{}", base(b), rest);
++            }
++            if rest.len() == 3 && b == "float" && rest.as_bytes()[0] == rest.as_bytes()[2] {
++                return format!("mat{}", &rest[..1]);
++            }
++        }
++    }
++    t.to_string()
+ }
+ 
+ fn floats_of(kind: hir::TypeKind) -> Option<usize> {
+@@ -202,9 +230,24 @@ impl<'a> Emitter<'a> {
+                 "float4"
+             }
+         };
++        if self.essl {
++            if matches!(kind, Mat23 | Mat24 | Mat32 | Mat34 | Mat42 | Mat43) {
++                self.err(format!("type {:?} has no GLSL ES 1.0 form", kind));
++            }
++            return essl_type(s);
++        }
+         s.to_string()
+     }
+ 
++    /// A conversion of `x` to the type HLSL calls `ty`.
++    fn cast(&self, ty: &str, x: &str) -> String {
++        if self.essl {
++            format!("{}({})", essl_type(ty), x)
++        } else {
++            format!("(({})({}))", ty, x)
++        }
++    }
++
+     fn type_spec(&mut self, ts: &syntax::TypeSpecifier) -> String {
+         use syntax::TypeSpecifierNonArray as T;
+         let s = match &ts.ty {
+@@ -226,6 +269,9 @@ impl<'a> Emitter<'a> {
+                 "float4"
+             }
+         };
++        if self.essl {
++            return essl_type(s);
++        }
+         s.into()
+     }
+ 
+@@ -276,6 +322,21 @@ impl<'a> Emitter<'a> {
+ 
+     fn sym_name(&self, sym: hir::SymRef) -> String {
+         let name = self.st.sym(sym).name.clone();
++        if self.essl {
++            return match name.as_str() {
++                // Arrives as a varying, like every other input.
++                "gl_FragCoord" => "glsl_FragCoord".into(),
++                // Words GLSL ES 1.0 reserves.
++                "input" | "output" | "sample" | "half" | "fixed" | "filter" | "sizeof"
++                | "cast" | "namespace" | "using" | "public" | "static" | "inline" | "long"
++                | "short" | "double" | "unsigned" | "superp" | "external" | "interface"
++                | "class" | "union" | "enum" | "typedef" | "template" | "this" | "packed"
++                | "goto" | "switch" | "default" | "volatile" | "flat" | "smooth" | "layout"
++                | "texture" | "noinline" | "asm" | "hvec2" | "hvec3" | "hvec4" | "fvec2"
++                | "fvec3" | "fvec4" | "sampler3DRect" | "sampler2DRect" => format!("{}_", name),
++                _ => name,
++            };
++        }
+         match name.as_str() {
+             // HLSL keywords and intrinsics that WebRender uses as names.
+             "sample" | "line" | "point" | "triangle" | "matrix" | "vector" | "texture"
+@@ -302,7 +363,11 @@ impl<'a> Emitter<'a> {
+                     hir::SymDecl::Global(hir::StorageClass::Sampler(..), ..) => {
+                         // A sampler outside a call; only meaningful as an
+                         // argument, which fun_call handles.
+-                        format!("{}_t", s.name)
++                        if self.essl {
++                            s.name.clone()
++                        } else {
++                            format!("{}_t", s.name)
++                        }
+                     }
+                     _ => {
+                         drop(s);
+@@ -331,6 +396,13 @@ impl<'a> Emitter<'a> {
+                 }
+             }
+             Binary(op, l, r) => self.binary(op, l, r),
++            Ternary(c, a, b) if self.essl && self.vector_condition(c).is_some() => {
++                // GLSL ES chooses whole values only; a vector condition
++                // chooses per component.
++                let n = self.vector_condition(c).unwrap();
++                let (c, a, b) = (self.expr(c), self.expr(a), self.expr(b));
++                format!("mix({}, {}, vec{}({}))", b, a, n, c)
++            }
+             Ternary(c, a, b) => {
+                 let c = self.expr(c);
+                 let a = self.expr(a);
+@@ -366,6 +438,25 @@ impl<'a> Emitter<'a> {
+         }
+     }
+ 
++    /// The width of a condition that is a boolean vector: a comparison
++    /// function's result, which the HIR may type as a plain bool.
++    fn vector_condition(&self, c: &hir::Expr) -> Option<usize> {
++        if is_vector(c.ty.kind) {
++            return floats_of(c.ty.kind);
++        }
++        if let hir::ExprKind::FunCall(hir::FunIdentifier::Identifier(f), args) = &c.kind {
++            let name = self.st.sym(*f).name.clone();
++            if matches!(
++                name.as_str(),
++                "lessThan" | "lessThanEqual" | "greaterThan" | "greaterThanEqual" | "equal" | "notEqual" | "not"
++            ) && is_vector(args[0].ty.kind)
++            {
++                return floats_of(args[0].ty.kind);
++            }
++        }
++        None
++    }
++
+     fn binary(&mut self, op: &syntax::BinaryOp, l: &hir::Expr, r: &hir::Expr) -> String {
+         use syntax::BinaryOp::*;
+         let ls = self.expr(l);
+@@ -376,7 +467,7 @@ impl<'a> Emitter<'a> {
+             Xor => format!("(({}) != ({}))", ls, rs),
+             Equal | NonEqual => {
+                 let cmp = if *op == Equal { "==" } else { "!=" };
+-                if is_vector(l.ty.kind) || is_vector(r.ty.kind) {
++                if !self.essl && (is_vector(l.ty.kind) || is_vector(r.ty.kind)) {
+                     // GLSL compares whole vectors; HLSL compares per
+                     // component.
+                     let f = if *op == Equal { "all" } else { "any" };
+@@ -393,7 +484,7 @@ impl<'a> Emitter<'a> {
+             Sub => format!("(({}) - ({}))", ls, rs),
+             Mult => self.mult(l, r, ls, rs),
+             Div => {
+-                if is_integer(l.ty.kind) && is_integer(r.ty.kind) {
++                if is_integer(l.ty.kind) && is_integer(r.ty.kind) && !self.essl {
+                     // Integer division truncates toward zero, as in GLSL.
+                     format!("((int)(({}) / ({})))", ls, rs)
+                 } else {
+@@ -405,7 +496,7 @@ impl<'a> Emitter<'a> {
+                     format!("glsl_imod({}, {})", ls, rs)
+                 } else {
+                     self.err("% on a non-integer".into());
+-                    format!("fmod({}, {})", ls, rs)
++                    format!("{}({}, {})", if self.essl { "mod" } else { "fmod" }, ls, rs)
+                 }
+             }
+             BitAnd => {
+@@ -428,14 +519,28 @@ impl<'a> Emitter<'a> {
+                 self.uses_bitops = true;
+                 format!("glsl_xor({}, {})", ls, rs)
+             }
+-            LShift => format!("((int)(({}) * exp2({})))", ls, rs),
+-            RShift => format!("((int)floor(({}) / exp2({})))", ls, rs),
++            LShift => self.shift(&ls, &rs, true),
++            RShift => self.shift(&ls, &rs, false),
++        }
++    }
++
++    fn shift(&self, ls: &str, rs: &str, left: bool) -> String {
++        if self.essl {
++            if left {
++                format!("int(float({}) * exp2(float({})))", ls, rs)
++            } else {
++                format!("int(floor(float({}) / exp2(float({}))))", ls, rs)
++            }
++        } else if left {
++            format!("((int)(({}) * exp2({})))", ls, rs)
++        } else {
++            format!("((int)floor(({}) / exp2({})))", ls, rs)
+         }
+     }
+ 
+     fn mult(&mut self, l: &hir::Expr, r: &hir::Expr, ls: String, rs: String) -> String {
+-        let lm = l.ty.kind.is_matrix();
+-        let rm = r.ty.kind.is_matrix();
++        let lm = l.ty.kind.is_matrix() && !self.essl;
++        let rm = r.ty.kind.is_matrix() && !self.essl;
+         // GLSL matrices are column-major and constructed from columns; they
+         // are stored here as HLSL matrices whose rows are GLSL's columns, so
+         // M * v in GLSL is mul(v, M) here, and v * M is mul(M, v).
+@@ -460,7 +565,7 @@ impl<'a> Emitter<'a> {
+             Sub => format!("{} -= {}", ls, rs),
+             Div => format!("{} /= {}", ls, rs),
+             Mult => {
+-                if l.ty.kind.is_matrix() || r.ty.kind.is_matrix() {
++                if (l.ty.kind.is_matrix() || r.ty.kind.is_matrix()) && !self.essl {
+                     let m = self.mult(l, r, ls.clone(), rs);
+                     format!("{} = {}", ls, m)
+                 } else {
+@@ -468,8 +573,8 @@ impl<'a> Emitter<'a> {
+                 }
+             }
+             Mod => format!("{} = glsl_imod({}, {})", ls, ls, rs),
+-            LShift => format!("{} = (int)(({}) * exp2({}))", ls, ls, rs),
+-            RShift => format!("{} = (int)floor(({}) / exp2({}))", ls, ls, rs),
++            LShift => format!("{} = {}", ls, self.shift(&ls, &rs, true)),
++            RShift => format!("{} = {}", ls, self.shift(&ls, &rs, false)),
+             And => {
+                 self.uses_bitops = true;
+                 format!("{} = glsl_and({}, {})", ls, ls, rs)
+@@ -501,7 +606,24 @@ impl<'a> Emitter<'a> {
+     }
+ 
+     fn texel_coord(&mut self, name: &str, p: &str) -> String {
+-        format!("(((float2)({}) + 0.5) * {}_size.zw)", p, name)
++        if self.essl {
++            format!("((vec2({}) + 0.5) * {}_size.zw)", p, name)
++        } else {
++            format!("(((float2)({}) + 0.5) * {}_size.zw)", p, name)
++        }
++    }
++
++    fn sample(&self, name: &str, uv: &str, kind: hir::TypeKind) -> String {
++        let s = if self.essl {
++            format!("texture2D({}, {})", name, uv)
++        } else {
++            format!("{0}_t.Sample({0}_s, {1})", name, uv)
++        };
++        if is_int_sampler(kind) {
++            self.cast("int4", &s)
++        } else {
++            s
++        }
+     }
+ 
+     fn fun_call(&mut self, e: &hir::Expr, fun: &hir::FunIdentifier, args: &[hir::Expr]) -> String {
+@@ -527,7 +649,11 @@ impl<'a> Emitter<'a> {
+                     let mut a = Vec::new();
+                     for arg in args {
+                         if let Some((sn, _)) = self.sampler_args(arg) {
+-                            a.push(format!("{0}_t, {0}_s, {0}_size", sn));
++                            if self.essl {
++                                a.push(format!("{0}, {0}_size", sn));
++                            } else {
++                                a.push(format!("{0}_t, {0}_s, {0}_size", sn));
++                            }
+                         } else {
+                             a.push(self.expr(arg));
+                         }
+@@ -563,12 +689,7 @@ impl<'a> Emitter<'a> {
+                 } else {
+                     uv
+                 };
+-                let s = format!("{0}_t.Sample({0}_s, {1})", sn, uv);
+-                if is_int_sampler(kind) {
+-                    format!("((int4)({}))", s)
+-                } else {
+-                    s
+-                }
++                self.sample(&sn, &uv, kind)
+             }
+             "texelFetch" | "texelFetchOffset" => {
+                 let (sn, kind) = match self.sampler_args(&args[0]) {
+@@ -588,15 +709,10 @@ impl<'a> Emitter<'a> {
+                     p
+                 };
+                 let uv = self.texel_coord(&sn, &p);
+-                let s = format!("{0}_t.Sample({0}_s, {1})", sn, uv);
+-                if is_int_sampler(kind) {
+-                    format!("((int4)({}))", s)
+-                } else {
+-                    s
+-                }
++                self.sample(&sn, &uv, kind)
+             }
+             "textureSize" => match self.sampler_args(&args[0]) {
+-                Some((sn, _)) => format!("((int2)({}_size.xy))", sn),
++                Some((sn, _)) => self.cast("int2", &format!("{}_size.xy", sn)),
+                 None => {
+                     self.err("textureSize on something that is not a sampler".into());
+                     "int2(1, 1)".into()
+@@ -606,12 +722,24 @@ impl<'a> Emitter<'a> {
+                 let a = self.expr(&args[0]);
+                 let b = self.expr(&args[1]);
+                 let t = self.expr(&args[2]);
+-                if args[2].ty.kind.is_bool() {
++                if self.essl && self.vector_condition(&args[2]).is_some() {
++                    let n = self.vector_condition(&args[2]).unwrap();
++                    format!("mix({}, {}, vec{}({}))", a, b, n, t)
++                } else if args[2].ty.kind.is_bool() {
+                     format!("(({}) ? ({}) : ({}))", t, b, a)
++                } else if self.essl {
++                    use hir::TypeKind::*;
++                    match args[2].ty.kind {
++                        BVec2 => format!("mix({}, {}, vec2({}))", a, b, t),
++                        BVec3 => format!("mix({}, {}, vec3({}))", a, b, t),
++                        BVec4 => format!("mix({}, {}, vec4({}))", a, b, t),
++                        _ => format!("mix({}, {}, {})", a, b, t),
++                    }
+                 } else {
+                     format!("lerp({}, {}, {})", a, b, t)
+                 }
+             }
++            _ if self.essl => self.essl_native_call(e, name, args),
+             "fract" => simple(self, "frac"),
+             "mod" => simple(self, "glsl_mod"),
+             "inversesqrt" => simple(self, "rsqrt"),
+@@ -644,6 +772,41 @@ impl<'a> Emitter<'a> {
+         }
+     }
+ 
++    fn essl_native_call(&mut self, e: &hir::Expr, name: &str, args: &[hir::Expr]) -> String {
++        let a: Vec<String> = args.iter().map(|x| self.expr(x)).collect();
++        let call = |f: &str| format!("{}({})", f, a.join(", "));
++        // GLSL ES 1.0's common functions take floats only.
++        if is_integer(e.ty.kind) && matches!(name, "min" | "max" | "clamp" | "abs" | "sign") {
++            let float_of = |k: hir::TypeKind| match floats_of(k) {
++                Some(1) | None => "float".to_string(),
++                Some(n) => format!("vec{}", n),
++            };
++            let fa: Vec<String> = args
++                .iter()
++                .zip(&a)
++                .map(|(x, s)| format!("{}({})", float_of(x.ty.kind), s))
++                .collect();
++            let int_t = self.type_kind(e.ty.kind);
++            return format!("{}({}({}))", int_t, name, fa.join(", "));
++        }
++        match name {
++            "roundEven" | "round" => call("glsl_round"),
++            "trunc" => call("glsl_trunc"),
++            "recip" => format!("(1.0 / ({}))", a[0]),
++            "not" if !is_vector(args[0].ty.kind) => format!("(!{})", a[0]),
++            "fract" | "mod" | "inversesqrt" | "atan" | "dFdx" | "dFdy" | "fwidth" | "lessThan"
++            | "lessThanEqual" | "greaterThan" | "greaterThanEqual" | "equal" | "notEqual"
++            | "not" | "abs" | "sign" | "floor" | "ceil" | "min" | "max" | "clamp" | "step"
++            | "smoothstep" | "sqrt" | "pow" | "exp" | "exp2" | "log" | "log2" | "sin" | "cos"
++            | "tan" | "asin" | "acos" | "length" | "distance" | "dot" | "cross" | "normalize"
++            | "reflect" | "any" | "all" | "faceforward" | "matrixCompMult" => call(name),
++            _ => {
++                self.err(format!("builtin {} has no GLSL ES 1.0 form", name));
++                call(name)
++            }
++        }
++    }
++
+     fn constructor(&mut self, ty: &hir::Type, args: &[hir::Expr]) -> String {
+         if ty.array_sizes.is_some() {
+             let w = self.array_wrapper(ty);
+@@ -659,6 +822,9 @@ impl<'a> Emitter<'a> {
+         if args.len() == 1 {
+             let a = self.expr(&args[0]);
+             let src = floats_of(args[0].ty.kind).unwrap_or(1);
++            if self.essl {
++                return format!("{}({})", tn, a);
++            }
+             if ty.kind.is_matrix() && args[0].ty.kind.is_scalar() {
+                 // mat(x) is x on the diagonal.
+                 let n = match ty.kind {
+@@ -699,6 +865,18 @@ impl<'a> Emitter<'a> {
+                 let arr = self.array_suffix(&ty);
+                 let cst = if storage == hir::StorageClass::Const { "const " } else { "" };
+                 match &head.initializer {
++                    Some(hir::Initializer::Simple(e)) if self.essl && ty.array_sizes.is_some() => {
++                        // GLSL ES 1.0 initialises no arrays: element by
++                        // element, out of the wrapper the value came in.
++                        let v = self.expr(e);
++                        let w = self.array_wrapper(&ty);
++                        let n = self.array_wrappers.iter().find(|x| x.0 == w).map_or(0, |x| x.2);
++                        let base = v.strip_suffix(".v").unwrap_or(&v).to_string();
++                        self.line(&format!("{} {}{};", tn, name, arr));
++                        let copies: Vec<String> =
++                            (0..n).map(|i| format!("{0}[{1}] = glsl_a.v[{1}];", name, i)).collect();
++                        self.line(&format!("{{ {} glsl_a = {}; {} }}", w, base, copies.join(" ")));
++                    }
+                     Some(hir::Initializer::Simple(e)) => {
+                         self.local_inits.insert(head.name, (**e).clone());
+                         let v = self.expr(e);
+@@ -798,7 +976,18 @@ impl<'a> Emitter<'a> {
+                     self.line("discard;")
+                 }
+                 hir::JumpStatement::Return(e) => {
+-                    if let (Some(e), Some(w)) = (e, self.ret_array.clone()) {
++                    if let (Some(e), Some(w), true) = (e, self.ret_array.clone(), self.essl) {
++                        // No array assignment in GLSL ES 1.0.
++                        let v = self.expr(e);
++                        if let Some(base) = v.strip_suffix(".v") {
++                            self.line(&format!("return {};", base));
++                        } else {
++                            let n = self.array_wrappers.iter().find(|x| x.0 == w).map_or(0, |x| x.2);
++                            let copies: Vec<String> =
++                                (0..n).map(|i| format!("glsl_r.v[{0}] = {1}[{0}];", i, v)).collect();
++                            self.line(&format!("{{ {} glsl_r; {} return glsl_r; }}", w, copies.join(" ")));
++                        }
++                    } else if let (Some(e), Some(w)) = (e, self.ret_array.clone()) {
+                         let v = self.expr(e);
+                         self.line(&format!("{{ {0} glsl_r; glsl_r.v = {1}; return glsl_r; }}", w, v));
+                     } else if let Some(e) = e {
+@@ -929,10 +1118,7 @@ impl<'a> Emitter<'a> {
+                 if contains_continue(body) {
+                     self.err("continue inside a loop".into());
+                 }
+-                self.line(&format!(
+-                    "[unroll({0})] for (int glsl_iter = 0; glsl_iter < {0}; glsl_iter++)",
+-                    self.loop_limit
+-                ));
++                self.line(&self.bounded_loop());
+                 self.line("{");
+                 self.indent += 1;
+                 self.line(&format!("if (!({})) break;", cond));
+@@ -947,10 +1133,7 @@ impl<'a> Emitter<'a> {
+             }
+             hir::IterationStatement::While(hir::Condition::Expr(c), body) => {
+                 let cond = self.expr(c);
+-                self.line(&format!(
+-                    "[unroll({0})] for (int glsl_iter = 0; glsl_iter < {0}; glsl_iter++)",
+-                    self.loop_limit
+-                ));
++                self.line(&self.bounded_loop());
+                 self.line("{");
+                 self.indent += 1;
+                 self.line(&format!("if (!({})) break;", cond));
+@@ -960,10 +1143,7 @@ impl<'a> Emitter<'a> {
+             }
+             hir::IterationStatement::DoWhile(body, c) => {
+                 let cond = self.expr(c);
+-                self.line(&format!(
+-                    "[unroll({0})] for (int glsl_iter = 0; glsl_iter < {0}; glsl_iter++)",
+-                    self.loop_limit
+-                ));
++                self.line(&self.bounded_loop());
+                 self.line("{");
+                 self.indent += 1;
+                 self.body(body);
+@@ -974,6 +1154,17 @@ impl<'a> Emitter<'a> {
+         }
+     }
+ 
++    fn bounded_loop(&self) -> String {
++        if self.essl {
++            format!("for (int glsl_iter = 0; glsl_iter < {0}; glsl_iter++)", self.loop_limit)
++        } else {
++            format!(
++                "[unroll({0})] for (int glsl_iter = 0; glsl_iter < {0}; glsl_iter++)",
++                self.loop_limit
++            )
++        }
++    }
++
+     // ------------------------------------------------------------------
+     // Functions
+ 
+@@ -991,10 +1182,14 @@ impl<'a> Emitter<'a> {
+                 hir::FunctionParameterDeclaration::Named(q, d) => {
+                     if is_sampler(d.ty.kind) {
+                         let n = d.name.as_str();
+-                        params.push(format!(
+-                            "Texture2D {0}_t, SamplerState {0}_s, float4 {0}_size",
+-                            n
+-                        ));
++                        if self.essl {
++                            params.push(format!("sampler2D {0}, vec4 {0}_size", n));
++                        } else {
++                            params.push(format!(
++                                "Texture2D {0}_t, SamplerState {0}_s, float4 {0}_size",
++                                n
++                            ));
++                        }
+                         continue;
+                     }
+                     let qs = match q {
+@@ -1247,6 +1442,44 @@ int glsl_or(int a, int b) { return a + b - glsl_and(a, b); }
+ int glsl_xor(int a, int b) { return a + b - 2 * glsl_and(a, b); }
+ "#;
+ 
++const ESSL_PRELUDE: &str = r#"// Generated by glsl-to-cxx for OpenGL ES 2.
++#extension GL_OES_standard_derivatives : enable
++precision highp float;
++precision highp int;
++#define glsl_mod(x, y) mod(x, y)
++// Half a step past a, so that a quotient that is a whole number does not
++// come out just below it on a GPU that divides through a reciprocal.
++int glsl_imod(int a, int b) { return int(float(a) - float(b) * floor((float(a) + 0.5) / float(b))); }
++ivec2 glsl_imod(ivec2 a, int b) { return ivec2(vec2(a) - float(b) * floor((vec2(a) + 0.5) / float(b))); }
++ivec2 glsl_imod(ivec2 a, ivec2 b) { return ivec2(vec2(a) - vec2(b) * floor((vec2(a) + 0.5) / vec2(b))); }
++ivec4 glsl_imod(ivec4 a, int b) { return ivec4(vec4(a) - float(b) * floor((vec4(a) + 0.5) / float(b))); }
++ivec4 glsl_imod(ivec4 a, ivec4 b) { return ivec4(vec4(a) - vec4(b) * floor((vec4(a) + 0.5) / vec4(b))); }
++float glsl_round(float x) { return floor(x + 0.5); }
++vec2 glsl_round(vec2 x) { return floor(x + 0.5); }
++vec3 glsl_round(vec3 x) { return floor(x + 0.5); }
++vec4 glsl_round(vec4 x) { return floor(x + 0.5); }
++float glsl_trunc(float x) { return sign(x) * floor(abs(x)); }
++vec2 glsl_trunc(vec2 x) { return sign(x) * floor(abs(x)); }
++vec3 glsl_trunc(vec3 x) { return sign(x) * floor(abs(x)); }
++vec4 glsl_trunc(vec4 x) { return sign(x) * floor(abs(x)); }
++"#;
++
++const ESSL_BITOPS: &str = r#"// No integer bit operations in GLSL ES 1.0; these values are small and non-negative.
++int glsl_bit(int a, int p) { return int(mod(floor((float(a) + 0.5) / float(p)), 2.0) * float(p)); }
++ivec2 glsl_bit(ivec2 a, int p) { return ivec2(mod(floor((vec2(a) + 0.5) / float(p)), 2.0) * float(p)); }
++ivec4 glsl_bit(ivec4 a, int p) { return ivec4(mod(floor((vec4(a) + 0.5) / float(p)), 2.0) * float(p)); }
++int glsl_and(int a, int b) {
++  float r = 0.0, x = float(a), y = float(b), p = 1.0;
++  for (int i = 0; i < 16; i++) {
++    r += mod(x, 2.0) * mod(y, 2.0) * p;
++    x = floor(x * 0.5); y = floor(y * 0.5); p *= 2.0;
++  }
++  return int(r);
++}
++int glsl_or(int a, int b) { return a + b - glsl_and(a, b); }
++int glsl_xor(int a, int b) { return a + b - 2 * glsl_and(a, b); }
++"#;
++
+ /// Translates a parsed fragment shader. `name` is only used in messages.
+ pub fn translate_fragment(
+     st: &hir::State,
+@@ -1264,8 +1497,20 @@ pub fn translate_fragment_limited(
+     tu: &hir::TranslationUnit,
+     loop_limit: usize,
+     clip_distance: bool,
++) -> Result<(String, Layout), Vec<String>> {
++    translate_fragment_dialect(st, tu, loop_limit, clip_distance, false)
++}
++
++/// As translate_fragment_limited, in GLSL ES 1.0 when `essl` is set.
++pub fn translate_fragment_dialect(
++    st: &hir::State,
++    tu: &hir::TranslationUnit,
++    loop_limit: usize,
++    clip_distance: bool,
++    essl: bool,
+ ) -> Result<(String, Layout), Vec<String>> {
+     let mut em = Emitter {
++        essl,
+         st,
+         out: String::new(),
+         indent: 0,
+@@ -1416,7 +1661,7 @@ pub fn translate_fragment_limited(
+     }
+ 
+     // Emit.
+-    em.out.push_str(PRELUDE);
++    em.out.push_str(if essl { ESSL_PRELUDE } else { PRELUDE });
+     let prelude_len = em.out.len();
+ 
+     for sym in &structs {
+@@ -1446,11 +1691,30 @@ pub fn translate_fragment_limited(
+         ));
+     }
+ 
+-    for (i, (name, kind)) in samplers.iter().enumerate() {
++    if essl {
++        for (i, (name, kind)) in samplers.iter().enumerate() {
++            em.line(&format!("uniform sampler2D {};", name));
++            em.line(&format!("uniform vec4 {}_size;", name));
++            layout.samplers.push(Sampler { name: name.clone(), kind: *kind, register: i });
++        }
++        layout.flat_register = samplers.len();
++        if layout.texture_floats > 0 {
++            em.line("uniform sampler2D glsl_flat;");
++            em.line("uniform vec4 glsl_flat_size;");
++        }
++        for (sym, ty) in &uniforms {
++            let tn = em.type_kind(ty.kind);
++            let arr = em.array_suffix(ty);
++            let n = em.sym_name(*sym);
++            em.line(&format!("uniform {} {}{};", tn, n, arr));
++        }
++    }
++    for (i, (name, kind)) in samplers.iter().enumerate().filter(|_| !essl) {
+         em.line(&format!("Texture2D {0}_t : register(t{1});", name, i));
+         em.line(&format!("SamplerState {0}_s : register(s{1});", name, i));
+         layout.samplers.push(Sampler { name: name.clone(), kind: *kind, register: i });
+     }
++    if !essl {
+     layout.flat_register = samplers.len();
+     if layout.texture_floats > 0 {
+         em.line(&format!("Texture2D glsl_flat_t : register(t{});", layout.flat_register));
+@@ -1477,30 +1741,32 @@ pub fn translate_fragment_limited(
+     }
+     em.indent -= 1;
+     em.line("};");
++    }
+ 
++    let stat = if essl { "" } else { "static " };
+     for l in &consts {
+         let d = hir::Declaration::InitDeclaratorList(l.clone());
+-        em.out.push_str("static ");
++        em.out.push_str(stat);
+         em.declaration(&d);
+     }
+     for (list, _) in [(&interps, false), (&flats, true)] {
+         for (sym, _, ty) in list.iter() {
+             let tn = em.type_kind(ty.kind);
+             let n = em.sym_name(*sym);
+-            em.line(&format!("static {} {};", tn, n));
++            em.line(&format!("{}{} {};", stat, tn, n));
+         }
+     }
+     for (sym, ty) in &statics {
+         let tn = em.type_kind(ty.kind);
+         let n = em.sym_name(*sym);
+         let arr = em.array_suffix(ty);
+-        em.line(&format!("static {} {}{};", tn, n, arr));
++        em.line(&format!("{}{} {}{};", stat, tn, n, arr));
+     }
+     if uses_fragcoord {
+-        em.line("static float4 gl_FragCoord;");
++        em.line(if essl { "vec4 glsl_FragCoord;" } else { "static float4 gl_FragCoord;" });
+     }
+     if clip_distance {
+-        em.line("static float4 swgl_ClipDistance;");
++        em.line(if essl { "vec4 swgl_ClipDistance;" } else { "static float4 swgl_ClipDistance;" });
+     }
+ 
+     let wrappers_at = em.out.len();
+@@ -1524,6 +1790,9 @@ pub fn translate_fragment_limited(
+     }
+ 
+     // The entry point: unpack the texture coordinates, run main.
++    if essl {
++        essl_entry(&mut em, &layout, &statics, clip_distance);
++    } else {
+     let mut input = String::from("struct glsl_input {\n");
+     for i in 0..layout.slots {
+         let _ = writeln!(input, "  float4 t{0} : TEXCOORD{0};", i);
+@@ -1589,6 +1858,7 @@ pub fn translate_fragment_limited(
+     em.line(&format!("return {};", out_name));
+     em.indent -= 1;
+     em.line("}");
++    }
+ 
+     let mut wrappers = String::new();
+     for (name, elem, n) in &em.array_wrappers {
+@@ -1603,9 +1873,13 @@ pub fn translate_fragment_limited(
+             assigns.join(" ")
+         );
+     }
++    let wrappers = if essl { essl_wrappers(&wrappers) } else { wrappers };
+     em.out.insert_str(wrappers_at, &wrappers);
+     if em.uses_bitops {
+-        em.out.insert_str(prelude_len, BITOPS);
++        em.out.insert_str(prelude_len, if essl { ESSL_BITOPS } else { BITOPS });
++    }
++    if essl {
++        em.out = em.out.replace("-1.#INF", "(-1e38)").replace("1.#INF", "1e38");
+     }
+     layout.uses_discard = em.uses_discard;
+     layout.accept = em.accepts.clone();
+@@ -1619,10 +1893,88 @@ pub fn translate_fragment_limited(
+     }
+ }
+ 
++/// The wrappers' element types, which essl's type_kind already gave in GLSL
++/// spelling apart from the wrapper names it built from them.
++fn essl_wrappers(w: &str) -> String {
++    w.to_string()
++}
++
++/// GLSL ES's main: the varyings come in as texture coordinates, packed as
++/// for 9_3, and leave as gl_FragColor.
++fn essl_entry(
++    em: &mut Emitter,
++    layout: &Layout,
++    statics: &[(hir::SymRef, hir::Type)],
++    clip_distance: bool,
++) {
++    for i in 0..layout.slots {
++        em.line(&format!("varying vec4 glsl_t{};", i));
++    }
++    em.line("void main()");
++    em.line("{");
++    em.indent += 1;
++    let comps = ["x", "y", "z", "w"];
++    let at = |o: usize| format!("glsl_t{}.{}", o / 4, comps[o % 4]);
++    if let Some(o) = layout.flat_coord_offset {
++        let texels = (layout.texture_floats + 3) / 4;
++        em.line(&format!("vec2 glsl_fuv = vec2({}, {});", at(o), at(o + 1)));
++        for k in 0..texels {
++            em.line(&format!(
++                "vec4 glsl_f{0} = texture2D(glsl_flat, glsl_fuv + vec2({0}.0 * glsl_flat_size.z, 0.0));",
++                k
++            ));
++        }
++    }
++    for v in layout.varyings.clone() {
++        let tn = em.type_kind(v.kind);
++        let parts: Vec<String> = (0..v.floats)
++            .map(|k| {
++                let o = v.offset + k;
++                let src = if v.in_texture {
++                    format!("glsl_f{}.{}", o / 4, comps[o % 4])
++                } else {
++                    at(o)
++                };
++                if v.integer {
++                    format!("floor({} + 0.5)", src)
++                } else if v.kind.is_bool() {
++                    format!("({} > 0.5)", src)
++                } else {
++                    src
++                }
++            })
++            .collect();
++        em.line(&format!("{} = {}({});", v.name, tn, parts.join(", ")));
++    }
++    if let Some(o) = layout.fragcoord_offset {
++        em.line(&format!("glsl_FragCoord = vec4({}, {}, 0.0, 1.0);", at(o), at(o + 1)));
++    }
++    if clip_distance {
++        em.uses_discard = true;
++        em.line("if (any(lessThan(swgl_ClipDistance, vec4(0.0)))) discard;");
++    }
++    em.line("glsl_main();");
++    let out_name = statics
++        .iter()
++        .map(|(sym, _)| em.sym_name(*sym))
++        .find(|n| n == "oFragColor")
++        .unwrap_or_else(|| "oFragColor".into());
++    em.line(&format!("gl_FragColor = {};", out_name));
++    em.indent -= 1;
++    em.line("}");
++}
++
+ /// Parses and translates one preprocessed fragment shader file.
+ pub fn translate_fragment_file(path: &str) -> Result<(String, Layout), Vec<String>> {
++    translate_fragment_file_dialect(path, false)
++}
++
++pub fn translate_fragment_file_dialect(
++    path: &str,
++    essl: bool,
++) -> Result<(String, Layout), Vec<String>> {
+     let (state, hir, _) = crate::parse_shader(path.to_string());
+-    translate_fragment(&state, &hir)
++    translate_fragment_dialect(&state, &hir, LOOP_LIMITS[0], false, essl)
+ }
+ 
+ /// The C++ that goes into SWGL's program class so the GPU path can use it:
+diff --git a/gfx/wr/glsl-to-cxx/src/lib.rs b/gfx/wr/glsl-to-cxx/src/lib.rs
+index fb0643430a..54ebad9156 100644
+--- a/gfx/wr/glsl-to-cxx/src/lib.rs
++++ b/gfx/wr/glsl-to-cxx/src/lib.rs
+@@ -57,6 +57,16 @@ pub fn translate(args: &mut dyn Iterator<Item = String>) -> String {
+ pub fn translate_with_gpu(
+     args: &mut dyn Iterator<Item = String>,
+     gpu: bool,
++) -> (String, Option<(Vec<(usize, String)>, hlsl::Layout)>, Vec<String>) {
++    translate_with_gpu_dialect(args, gpu, false)
++}
++
++/// As translate_with_gpu, with the fragment half in GLSL ES 1.0 when `essl`
++/// is set.
++pub fn translate_with_gpu_dialect(
++    args: &mut dyn Iterator<Item = String>,
++    gpu: bool,
++    essl: bool,
+ ) -> (String, Option<(Vec<(usize, String)>, hlsl::Layout)>, Vec<String>) {
+     let _cmd_name = args.next();
+     let vertex_file = args.next().unwrap();
+@@ -85,12 +95,12 @@ pub fn translate_with_gpu(
+         // One pixel shader per loop limit, most generous first; the caller
+         // keeps the first one its compiler accepts. The layout is the same.
+         let clip = vs_state.used_clip_dist != 0;
+-        match hlsl::translate_fragment_limited(&fs_state, &fs_hir, hlsl::LOOP_LIMITS[0], clip) {
++        match hlsl::translate_fragment_dialect(&fs_state, &fs_hir, hlsl::LOOP_LIMITS[0], clip, essl) {
+             Ok((first, layout)) => {
+                 let mut sources = vec![(hlsl::LOOP_LIMITS[0], first)];
+                 for &limit in &hlsl::LOOP_LIMITS[1..] {
+                     if let Ok((src, _)) =
+-                        hlsl::translate_fragment_limited(&fs_state, &fs_hir, limit, clip)
++                        hlsl::translate_fragment_dialect(&fs_state, &fs_hir, limit, clip, essl)
+                     {
+                         sources.push((limit, src));
+                     }
+diff --git a/gfx/wr/glsl-to-cxx/src/main.rs b/gfx/wr/glsl-to-cxx/src/main.rs
+index 15be885640..f076ec5ef0 100644
+--- a/gfx/wr/glsl-to-cxx/src/main.rs
++++ b/gfx/wr/glsl-to-cxx/src/main.rs
+@@ -11,7 +11,9 @@ fn main() {
+     // pixel shaders, one .hlsl per preprocessed fragment shader, and a line
+     // per shader saying whether it translated and how its varyings are laid
+     // out. Compile the results with fxc /T ps_4_0_level_9_3.
+-    if args.len() >= 3 && args[1] == "--hlsl" {
++    // --essl: the same as GLSL ES 1.0, .frag files for OpenGL ES 2.
++    if args.len() >= 3 && (args[1] == "--hlsl" || args[1] == "--essl") {
++        let essl = args[1] == "--essl";
+         let out_dir = &args[2];
+         for f in &args[3..] {
+             let stem = std::path::Path::new(f)
+@@ -19,9 +21,10 @@ fn main() {
+                 .unwrap()
+                 .to_string_lossy()
+                 .to_string();
+-            match glsl_to_cxx::hlsl::translate_fragment_file(f) {
++            match glsl_to_cxx::hlsl::translate_fragment_file_dialect(f, essl) {
+                 Ok((src, layout)) => {
+-                    std::fs::File::create(format!("{}/{}.hlsl", out_dir, stem))
++                    let ext = if essl { "essl.frag" } else { "hlsl" };
++                    std::fs::File::create(format!("{}/{}.{}", out_dir, stem, ext))
+                         .unwrap()
+                         .write_all(src.as_bytes())
+                         .unwrap();
+diff --git a/gfx/wr/swgl/build.rs b/gfx/wr/swgl/build.rs
+index 126639aff7..4f6edadc2e 100644
+--- a/gfx/wr/swgl/build.rs
++++ b/gfx/wr/swgl/build.rs
+@@ -160,8 +160,10 @@ fn translate_shader(
+         std::fs::write(format!("{out_dir}/{shader}.h"), result).unwrap();
+         return false;
+     }
++    let essl = gpu_essl();
+     let fxc = match gpu_compiler() {
+         Some(f) => f,
++        None if essl => String::new(),
+         None => return false,
+     };
+     // YUV: the GPU dialect's colour-matrix code needs matrix operations SWGL's
+@@ -172,7 +174,7 @@ fn translate_shader(
+     // Shaders glsl-to-cxx cannot take outside SWGL's dialect just have no GPU
+     // variant.
+     let translated = std::panic::catch_unwind(|| {
+-        glsl_to_cxx::translate_with_gpu(&mut args.into_iter(), true)
++        glsl_to_cxx::translate_with_gpu_dialect(&mut args.into_iter(), true, essl)
+     });
+     let (result, gpu, gpu_errors) = match translated {
+         Ok(r) => r,
+@@ -182,9 +184,87 @@ fn translate_shader(
+         }
+     };
+     std::fs::write(format!("{out_dir}/{shader}.h"), result).unwrap();
++    if essl {
++        return write_essl_header(&out_dir, &shader, gpu, &gpu_errors);
++    }
+     write_gpu_header(&out_dir, &shader, Some(&fxc), gpu, &gpu_errors)
+ }
+ 
++/// GLSL ES 1.0 fragment shaders for OpenGL ES 2 (iOS, or SWGL_ESSL=1 to see
++/// them elsewhere): the GPU path of gpu_gles2.h compiles them on the device.
++fn gpu_essl() -> bool {
++    println!("cargo:rerun-if-env-changed=SWGL_ESSL");
++    std::env::var("CARGO_CFG_TARGET_OS").ok().as_deref() == Some("ios")
++        || std::env::var("SWGL_ESSL").map_or(false, |v| v == "1")
++}
++
++/// The fragment shader's source goes where 9_3's bytecode would, with its
++/// terminating zero. Loops are unrolled to the first limit; the device
++/// compiler sees nothing longer.
++fn write_essl_header(
++    out_dir: &str,
++    shader: &str,
++    gpu: Option<(Vec<(usize, String)>, glsl_to_cxx::hlsl::Layout)>,
++    errors: &[String],
++) -> bool {
++    let path = format!("{out_dir}/{shader}_gpu.h");
++    let (sources, layout) = match gpu {
++        Some(g) => g,
++        None => {
++            println!("cargo:warning=swgl: {shader} stays on the CPU: {}", errors.join(" | "));
++            let stub =
++                format!("static const GpuProgramInfo* {shader}_gpu_info() {{ return nullptr; }}\n");
++            std::fs::write(path, stub).unwrap();
++            return false;
++        }
++    };
++    let (limit, src) = &sources[0];
++    std::fs::write(format!("{out_dir}/{shader}.essl.frag"), src).unwrap();
++    let mut bytes = src.clone().into_bytes();
++    bytes.push(0);
++    std::fs::write(path, gpu_info_header(shader, &bytes, &layout, *limit)).unwrap();
++    true
++}
++
++fn gpu_info_header(
++    shader: &str,
++    bytes: &[u8],
++    layout: &glsl_to_cxx::hlsl::Layout,
++    loop_limit: usize,
++) -> String {
++    let mut h = bytes_array(&format!("{shader}_ps"), bytes);
++    let rect: Vec<String> = layout
++        .samplers
++        .iter()
++        .map(|s| {
++            let r = format!("{:?}", s.kind).contains("Rect");
++            (r as u8).to_string()
++        })
++        .chain(std::iter::once("0".to_string()))
++        .collect();
++    let _ = writeln!(
++        h,
++        "static const unsigned char {shader}_srect[] = {{ {} }};",
++        rect.join(", ")
++    );
++    let _ = writeln!(
++        h,
++        "static const GpuProgramInfo {shader}_gpu_info_data = {{ {shader}_ps, sizeof({shader}_ps), {}, {}, {}, {}, {}, \"{shader}\", {shader}_srect, {}, {} }};",
++        layout.slots,
++        layout.texture_floats,
++        layout.flat_coord_offset.map_or(-1, |o| o as i64),
++        layout.fragcoord_offset.map_or(-1, |o| o as i64),
++        layout.samplers.len(),
++        loop_limit,
++        !layout.accept.is_empty() as i32,
++    );
++    let _ = writeln!(
++        h,
++        "static const GpuProgramInfo* {shader}_gpu_info() {{ return &{shader}_gpu_info_data; }}"
++    );
++    h
++}
++
+ /// fxc, when building for Windows: the fragment shaders are also compiled for
+ /// Direct3D feature level 9_3 so that SWGL can hand pixel shading to GPUs that
+ /// cannot run WebRender. SWGL_FXC names it explicitly (empty turns the GPU
+@@ -321,6 +401,11 @@ fn write_gpu_header(
+ /// One per number of texture coordinates, plus a clear shader.
+ fn write_gpu_common(out_dir: &str) {
+     let path = format!("{out_dir}/gpu_shaders.h");
++    if gpu_essl() {
++        // The few shaders of its own gpu_gles2.h keeps as source.
++        std::fs::write(path, "#define SWGL_GPU_SHADERS 1\n#define SWGL_GPU_ESSL 1\n").unwrap();
++        return;
++    }
+     let fxc = match gpu_compiler() {
+         Some(f) => f,
+         None => {
+diff --git a/gfx/wr/swgl/src/glsl.h b/gfx/wr/swgl/src/glsl.h
+index 22b9ba02f0..b6606b1a68 100644
+--- a/gfx/wr/swgl/src/glsl.h
++++ b/gfx/wr/swgl/src/glsl.h
+@@ -2843,6 +2843,13 @@ SI R mix(T x, T y, bvec2 a) {
+   return if_then_else(a, y, x);
+ }
+ 
++// A constant and a per-vertex value chosen between per component (the GPU
++// variants' vertex shaders).
++SI vec4 mix(vec4_scalar x, vec4 y, bvec4 a) { return if_then_else(a, y, vec4(x)); }
++SI vec4 mix(vec4 x, vec4_scalar y, bvec4 a) { return if_then_else(a, vec4(y), x); }
++SI vec2 mix(vec2_scalar x, vec2 y, bvec2 a) { return if_then_else(a, y, vec2(x)); }
++SI vec2 mix(vec2 x, vec2_scalar y, bvec2 a) { return if_then_else(a, vec2(y), x); }
++
+ template <typename T>
+ SI T mix(T x, T y, bvec4_scalar a) {
+   return T{a.x ? y.x : x.x, a.y ? y.y : x.y, a.z ? y.z : x.z, a.w ? y.w : x.w};
+-- 
+2.53.0
+

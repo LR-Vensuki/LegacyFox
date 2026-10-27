@@ -42,6 +42,13 @@ pref("layout.css.report_errors", false);
 pref("network.http.max-connections", 32);
 pref("network.http.max-persistent-connections-per-server", 4);
 pref("network.http.http3.enable", false);
+// No zstd: each response decodes through an 8 MB window (9 MB with its
+// buffers), and a page loads several at once. Brotli sizes its window to the
+// response.
+pref("network.http.accept-encoding.secure", "gzip, deflate, br");
+// DNS lookups on 4 threads instead of up to 40 (each one a stack).
+pref("network.dns.max_high_priority_threads", 4);
+pref("network.dns.max_any_priority_threads", 2);
 pref("dom.max_script_run_time", 20);
 
 // ---- Fonts ------------------------------------------------------------------
@@ -164,3 +171,9 @@ pref("intl.accept_languages", "ru-RU, ru, en-US, en");
 // loads the DevTools server and all its actors at startup.
 pref("devtools.debugger.remote-enabled", false);
 pref("devtools.chrome.enabled", false);
+
+// ---- http stays http -----------------------------------------------------------
+// HTTPS-First would switch http addresses to https and, with the shell's own
+// error pages, never fall back: http-only sites could not be opened.
+pref("dom.security.https_first", false);
+pref("dom.security.https_first_pbm", false);

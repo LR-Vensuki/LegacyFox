@@ -58,7 +58,9 @@ make package                  # packages/*.deb
 
 Подход к оптимизации взят у
 [gecko-w10m](https://github.com/Computershik73/gecko-w10m): один процесс, свой
-Rust-таргет, software WebRender, ужатые лимиты памяти.
+Rust-таргет, software WebRender, ужатые лимиты памяти. Оттуда же (автор Ilya
+Vysotsky, MPL) пришёл GPU-путь SWGL: пиксели страницы досчитывает графический
+процессор, в LegacyFox он переведён на OpenGL ES 2 (параметр «Рисовать на GPU»).
 
 ## Лицензия
 

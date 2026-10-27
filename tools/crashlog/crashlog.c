@@ -12,6 +12,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/ucontext.h>
+#include <sys/time.h>
 #include <mach-o/dyld.h>
 #include <mach/mach.h>
 
@@ -30,13 +31,28 @@ static void where(const char *what, uintptr_t addr) {
 
 static pthread_t main_thread;
 
+// Wall-clock milliseconds, as GeckoView stamps its log lines.
+static unsigned long long now_ms(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (unsigned long long)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+}
+
+// Frame pointers are followed only inside the thread's stack: JIT code does
+// not keep r7 as one, and a stray value sent the walk into unmapped memory.
+static int frame_ok(uintptr_t *fp, pthread_t thread) {
+    uintptr_t hi = (uintptr_t)pthread_get_stackaddr_np(thread);
+    uintptr_t lo = hi - pthread_get_stacksize_np(thread);
+    return !((uintptr_t)fp & 3) && (uintptr_t)fp >= lo && (uintptr_t)(fp + 2) <= hi;
+}
+
 static void dump_frames(ucontext_t *uc) {
 #if defined(__arm__)
     struct __darwin_arm_thread_state *ts = &uc->uc_mcontext->__ss;
     where("pc", ts->__pc);
     where("lr", ts->__lr);
     uintptr_t *fp = (uintptr_t *)ts->__r[7];
-    for (int i = 0; fp && i < 60; i++) {
+    for (int i = 0; frame_ok(fp, pthread_self()) && i < 60; i++) {
         uintptr_t ret = fp[1];
         if (!ret)
             break;
@@ -55,16 +71,16 @@ static void sample(int sig, siginfo_t *si, void *ctx) {
         pthread_kill(main_thread, SIGUSR1);
         return;
     }
-    fprintf(stderr, "\n*** crashlog: main thread sample\n");
+    fprintf(stderr, "\n*** crashlog: main thread sample at %llu\n", now_ms());
     dump_frames(ctx);
 }
 
 // SIGUSR2: every thread's stack, for hangs that are not on the main thread.
-static void walk(uintptr_t pc, uintptr_t lr, uintptr_t fp0) {
+static void walk(pthread_t thread, uintptr_t pc, uintptr_t lr, uintptr_t fp0) {
     where("pc", pc);
     where("lr", lr);
     uintptr_t *fp = (uintptr_t *)fp0;
-    for (int i = 0; fp && i < 40; i++) {
+    for (int i = 0; thread && frame_ok(fp, thread) && i < 40; i++) {
         uintptr_t ret = fp[1];
         if (!ret)
             break;
@@ -86,7 +102,7 @@ static void sample_all(int sig, siginfo_t *si, void *ctx) {
     for (mach_msg_type_number_t i = 0; i < count; i++) {
         char name[64] = "";
         if (threads[i] == self) {
-            fprintf(stderr, "\n*** thread %u (this one)\n", i);
+            fprintf(stderr, "\n*** thread %u (this one) at %llu\n", i, now_ms());
             continue;
         }
         thread_suspend(threads[i]);
@@ -96,8 +112,9 @@ static void sample_all(int sig, siginfo_t *si, void *ctx) {
             pthread_t pt = pthread_from_mach_thread_np(threads[i]);
             if (pt)
                 pthread_getname_np(pt, name, sizeof(name));
-            fprintf(stderr, "\n*** thread %u %s\n", i, name);
-            walk(st.__pc, st.__lr, st.__r[7]);
+            fprintf(stderr, "\n*** thread %u %s (stack %lu KB)\n", i, name,
+                    pt ? (unsigned long)(pthread_get_stacksize_np(pt) >> 10) : 0UL);
+            walk(pt, st.__pc, st.__lr, st.__r[7]);
         }
         thread_resume(threads[i]);
     }
@@ -116,7 +133,7 @@ static void handler(int sig, siginfo_t *si, void *ctx) {
         fprintf(stderr, "  r%-2d 0x%08x%s", i, ts->__r[i], i % 4 == 3 ? "\n" : "");
     fprintf(stderr, "\n  frames:\n");
     uintptr_t *fp = (uintptr_t *)ts->__r[7];
-    for (int i = 0; fp && i < 40; i++) {
+    for (int i = 0; frame_ok(fp, pthread_self()) && i < 40; i++) {
         uintptr_t ret = fp[1];
         if (!ret)
             break;
@@ -197,7 +214,7 @@ static void *traced_mmap(void *addr, size_t len, int prot, int flags, int fd, of
         fcntl(fd, F_GETPATH, path);
         fprintf(stderr, "\n*** crashlog: mmap %lu KB of %s\n", (unsigned long)(len >> 10), path);
         uintptr_t *fp = __builtin_frame_address(0);
-        for (int i = 0; fp && i < 80; i++) {
+        for (int i = 0; frame_ok(fp, pthread_self()) && i < 80; i++) {
             uintptr_t ret = fp[1];
             if (!ret)
                 break;

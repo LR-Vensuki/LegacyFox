@@ -12,3 +12,4 @@ Cargo.lock
 /tools/crashlog/crashlog.dylib
 # device screenshots with personal data
 /docs/screenshots/
+/tools/glinfo/glinfo

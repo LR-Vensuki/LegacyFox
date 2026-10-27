@@ -1,0 +1,52 @@
+From 7473354005357bfafed3ac502b59f2669a0356f7 Mon Sep 17 00:00:00 2001
+From: LR-Vensuki <260785366+LR-Vensuki@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 00:50:30 +0300
+Subject: [PATCH] Legacy iOS memory watcher: the GPU path's page goes earlier
+
+Its driver needs about 90 MB more address space and 16 MB blocks: with
+LF_SWGL_GPU=1 memory counts as low below 152 MB free (or a 64 MB hole),
+and as critical below 100 MB (or a 44 MB hole).
+---
+ widget/uikit/nsAppShell.mm | 19 +++++++++++++------
+ 1 file changed, 13 insertions(+), 6 deletions(-)
+
+diff --git a/widget/uikit/nsAppShell.mm b/widget/uikit/nsAppShell.mm
+index 89f9457c31..057812833f 100644
+--- a/widget/uikit/nsAppShell.mm
++++ b/widget/uikit/nsAppShell.mm
+@@ -111,10 +111,17 @@ static void WatchAddressSpace() {
+       loggedLevel = level;
+     }
+     TimeStamp now = TimeStamp::Now();
+-    bool tight =
+-        free < (112u << 20) || largest < (40u << 20) || level < 20;
+-    bool roomy =
+-        free > (160u << 20) && largest > (64u << 20) && level > 30;
++    // The SWGL GPU path's driver needs about 90 MB more and blocks of 16 MB:
++    // with it the page goes earlier.
++    static const bool gpu = [] {
++      const char* on = getenv("LF_SWGL_GPU");
++      return on && *on == '1';
++    }();
++    const vm_size_t mb = 1u << 20;
++    bool tight = free < (gpu ? 152 : 112) * mb ||
++                 largest < (gpu ? 64 : 40) * mb || level < 20;
++    bool roomy = free > (gpu ? 200 : 160) * mb &&
++                 largest > (gpu ? 96 : 64) * mb && level > 30;
+     // Again every 30 s while it stays tight, every 10 s near the end.
+     if (tight &&
+         (!low || (now - lowSince).ToSeconds() > (level < 12 ? 10 : 30))) {
+@@ -139,8 +146,8 @@ static void WatchAddressSpace() {
+     }
+     // iOS sends its last warning near 10% and kills a few points lower; the
+     // GPU driver crashes once it finds no hole for its 16 MB blocks.
+-    bool critical =
+-        level <= 10 || free < (64u << 20) || largest < (24u << 20);
++    bool critical = level <= 10 || free < (gpu ? 100 : 64) * mb ||
++                    largest < (gpu ? 44 : 24) * mb;
+     if (critical &&
+         (criticalSince.IsNull() || (now - criticalSince).ToSeconds() > 20)) {
+       fprintf(stderr,
+-- 
+2.53.0
+

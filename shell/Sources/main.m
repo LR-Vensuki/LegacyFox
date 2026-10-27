@@ -1,4 +1,5 @@
 #import "LFAppDelegate.h"
+#import "LFSettings.h"
 #import "Gecko/LFGecko.h"
 #include <dlfcn.h>
 #include <stdio.h>
@@ -37,6 +38,10 @@ static void LFDebugSetup(void) {
 int main(int argc, char *argv[]) {
     NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
     LFDebugSetup();
+    [LFSettings applyGpuRendering];
+    // Rust threads (WebRender's eight, Glean's) get 1 MB stacks instead of
+    // 2 MB: address space is what a 32-bit browser runs out of.
+    setenv("RUST_MIN_STACK", "1048576", 0);
     // Gecko owns the application: it calls UIApplicationMain and tells the
     // shell when to build its window (GeckoAppShellDidFinishLaunching).
     [LFAppDelegate prepare];

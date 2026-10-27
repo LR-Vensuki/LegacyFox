@@ -1,0 +1,2251 @@
+From 09949da81e6d18876d1dd2cbc0df5edd97669f1b Mon Sep 17 00:00:00 2001
+From: LR-Vensuki <260785366+LR-Vensuki@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 23:29:47 +0300
+Subject: [PATCH] SWGL pixel shading on OpenGL ES 2 for legacy iOS
+ (LF_SWGL_GPU=1)
+
+gpu_gles2.h does for an OpenGL ES 2 GPU what gpu_d3d11.h does for
+Direct3D 9_3: WebRender's vertex shaders stay on SWGL's CPU path, the
+quads and varyings go to the GPU, which shades them with the GLSL ES
+fragment shaders compiled on the device. Compositor tiles are drawn on
+the GPU through textures over their IOSurfaces (EAGLContext's iOS 5-10
+texImageIOSurface), and the GPU is finished before Core Animation shows
+them. Also: glsl-to-cxx lowers a switch case that ends in return, which
+ps_text_run's GPU variant has.
+---
+ gfx/layers/NativeLayerCA.h                    |    4 +
+ gfx/layers/NativeLayerCA.mm                   |    9 +
+ gfx/layers/NativeLayerMacSurfaceHandler.h     |    8 +
+ gfx/layers/NativeLayerMacSurfaceHandler.mm    |   36 +
+ .../RenderCompositorNative.cpp                |   79 +
+ .../RenderCompositorNative.h                  |   15 +
+ .../RenderCompositorSWGLGPU.h                 |   40 +
+ .../RenderCompositorSWGLGPU.mm                |  119 ++
+ gfx/webrender_bindings/moz.build              |    4 +
+ gfx/wr/glsl-to-cxx/src/hlsl.rs                |    8 +-
+ gfx/wr/glsl-to-cxx/src/lib.rs                 |    3 +-
+ gfx/wr/swgl/build.rs                          |    5 +-
+ gfx/wr/swgl/src/gl.cc                         |   11 +
+ gfx/wr/swgl/src/gpu_d3d11.h                   |    2 +-
+ gfx/wr/swgl/src/gpu_gles2.h                   | 1673 +++++++++++++++++
+ 15 files changed, 2011 insertions(+), 5 deletions(-)
+ create mode 100644 gfx/webrender_bindings/RenderCompositorSWGLGPU.h
+ create mode 100644 gfx/webrender_bindings/RenderCompositorSWGLGPU.mm
+ create mode 100644 gfx/wr/swgl/src/gpu_gles2.h
+
+diff --git a/gfx/layers/NativeLayerCA.h b/gfx/layers/NativeLayerCA.h
+index 4714b8a157..da92bd534e 100644
+--- a/gfx/layers/NativeLayerCA.h
++++ b/gfx/layers/NativeLayerCA.h
+@@ -379,6 +379,10 @@ class NativeLayerCA : public NativeLayer {
+   RefPtr<gfx::DrawTarget> NextSurfaceAsDrawTarget(
+       const gfx::IntRect& aDisplayRect, const gfx::IntRegion& aUpdateRegion,
+       gfx::BackendType aBackendType) override;
++#if defined(MOZ_IOS_LEGACY)
++  CFTypeRefPtr<IOSurfaceRef> NextSurfaceAsIOSurface(
++      const gfx::IntRect& aDisplayRect, const gfx::IntRegion& aUpdateRegion);
++#endif
+   Maybe<GLuint> NextSurfaceAsFramebuffer(const gfx::IntRect& aDisplayRect,
+                                          const gfx::IntRegion& aUpdateRegion,
+                                          bool aNeedsDepth) override;
+diff --git a/gfx/layers/NativeLayerCA.mm b/gfx/layers/NativeLayerCA.mm
+index 122442575e..25cfb72847 100644
+--- a/gfx/layers/NativeLayerCA.mm
++++ b/gfx/layers/NativeLayerCA.mm
+@@ -1384,6 +1384,15 @@ RefPtr<gfx::DrawTarget> NativeLayerCA::NextSurfaceAsDrawTarget(
+                                                   aBackendType);
+ }
+ 
++#if defined(MOZ_IOS_LEGACY)
++CFTypeRefPtr<IOSurfaceRef> NativeLayerCA::NextSurfaceAsIOSurface(
++    const IntRect& aDisplayRect, const IntRegion& aUpdateRegion) {
++  MutexAutoLock lock(mMutex);
++  MOZ_ASSERT(mSurfaceHandler);
++  return mSurfaceHandler->NextSurfaceAsIOSurface(aDisplayRect, aUpdateRegion);
++}
++#endif
++
+ Maybe<GLuint> NativeLayerCA::NextSurfaceAsFramebuffer(
+     const IntRect& aDisplayRect, const IntRegion& aUpdateRegion,
+     bool aNeedsDepth) {
+diff --git a/gfx/layers/NativeLayerMacSurfaceHandler.h b/gfx/layers/NativeLayerMacSurfaceHandler.h
+index b393976763..4b29f4a098 100644
+--- a/gfx/layers/NativeLayerMacSurfaceHandler.h
++++ b/gfx/layers/NativeLayerMacSurfaceHandler.h
+@@ -140,6 +140,14 @@ class NativeLayerMacSurfaceHandler {
+                                          const gfx::IntRegion& aUpdateRegion,
+                                          bool aNeedsDepth);
+ 
++#if defined(MOZ_IOS_LEGACY)
++  // The next surface itself, for a GPU that draws into it through a texture
++  // of its own (SWGL's pixel shading on OpenGL ES 2). Valid content the
++  // update leaves alone is copied in on the CPU.
++  CFTypeRefPtr<IOSurfaceRef> NextSurfaceAsIOSurface(
++      const gfx::IntRect& aDisplayRect, const gfx::IntRegion& aUpdateRegion);
++#endif
++
+   // Indicates that the surface which has been returned from the most recent
+   // call to NextSurface* is now finished being drawn to and can be displayed on
+   // the screen. Resets the invalid region on the surface to the empty region.
+diff --git a/gfx/layers/NativeLayerMacSurfaceHandler.mm b/gfx/layers/NativeLayerMacSurfaceHandler.mm
+index 46f6d78ef8..01d0e276b1 100644
+--- a/gfx/layers/NativeLayerMacSurfaceHandler.mm
++++ b/gfx/layers/NativeLayerMacSurfaceHandler.mm
+@@ -208,6 +208,42 @@ RefPtr<gfx::DrawTarget> NativeLayerMacSurfaceHandler::NextSurfaceAsDrawTarget(
+   return dt;
+ }
+ 
++#if defined(MOZ_IOS_LEGACY)
++CFTypeRefPtr<IOSurfaceRef> NativeLayerMacSurfaceHandler::NextSurfaceAsIOSurface(
++    const IntRect& aDisplayRect, const IntRegion& aUpdateRegion) {
++  if (!NextSurface()) {
++    return nullptr;
++  }
++  CFTypeRefPtr<IOSurfaceRef> target = mInProgressSurface->mSurface;
++  HandlePartialUpdate(
++      aDisplayRect, aUpdateRegion,
++      [&](CFTypeRefPtr<IOSurfaceRef> validSource,
++          const gfx::IntRegion& copyRegion) {
++        IOSurfaceRef src = validSource.get();
++        IOSurfaceRef dst = target.get();
++        if (IOSurfaceLock(src, kIOSurfaceLockReadOnly, nullptr) != 0) {
++          return;
++        }
++        if (IOSurfaceLock(dst, 0, nullptr) == 0) {
++          const uint8_t* s = (const uint8_t*)IOSurfaceGetBaseAddress(src);
++          uint8_t* d = (uint8_t*)IOSurfaceGetBaseAddress(dst);
++          size_t sStride = IOSurfaceGetBytesPerRow(src);
++          size_t dStride = IOSurfaceGetBytesPerRow(dst);
++          for (auto iter = copyRegion.RectIter(); !iter.Done(); iter.Next()) {
++            const gfx::IntRect& r = iter.Get();
++            for (int y = r.y; y < r.YMost(); y++) {
++              memcpy(d + y * dStride + r.x * 4, s + y * sStride + r.x * 4,
++                     size_t(r.width) * 4);
++            }
++          }
++          IOSurfaceUnlock(dst, 0, nullptr);
++        }
++        IOSurfaceUnlock(src, kIOSurfaceLockReadOnly, nullptr);
++      });
++  return target;
++}
++#endif
++
+ Maybe<GLuint> NativeLayerMacSurfaceHandler::NextSurfaceAsFramebuffer(
+     const IntRect& aDisplayRect, const IntRegion& aUpdateRegion,
+     bool aNeedsDepth) {
+diff --git a/gfx/webrender_bindings/RenderCompositorNative.cpp b/gfx/webrender_bindings/RenderCompositorNative.cpp
+index f60325f45f..8d7ae923b1 100644
+--- a/gfx/webrender_bindings/RenderCompositorNative.cpp
++++ b/gfx/webrender_bindings/RenderCompositorNative.cpp
+@@ -20,6 +20,10 @@
+ #include "mozilla/webrender/RenderThread.h"
+ #include "mozilla/widget/CompositorWidget.h"
+ #include "RenderCompositorRecordedFrame.h"
++#if defined(MOZ_IOS_LEGACY)
++#  include "mozilla/layers/NativeLayerCA.h"
++#  include "RenderCompositorSWGLGPU.h"
++#endif
+ 
+ namespace mozilla::wr {
+ 
+@@ -643,17 +647,65 @@ RenderCompositorNativeSWGL::RenderCompositorNativeSWGL(
+     const RefPtr<widget::CompositorWidget>& aWidget, void* aContext)
+     : RenderCompositorNative(aWidget), mContext(aContext) {
+   MOZ_ASSERT(mContext);
++#if defined(MOZ_IOS_LEGACY)
++  // LF_SWGL_GPU=1: the GPU shades the pixels of the tiles SWGL draws.
++  const char* gpu = getenv("LF_SWGL_GPU");
++  if (gpu && *gpu == '1') {
++    mGpu = SwglGpuEAGLCreate();
++  }
++#endif
+ }
+ 
+ RenderCompositorNativeSWGL::~RenderCompositorNativeSWGL() {
++#if defined(MOZ_IOS_LEGACY)
++  if (mGpu) {
++    // SWGL's GPU textures go with its context, in the GL context.
++    SwglGpuEAGLMakeCurrent(mGpu);
++  }
++#endif
+   wr_swgl_destroy_context(mContext);
++#if defined(MOZ_IOS_LEGACY)
++  SwglGpuEAGLDestroy(mGpu);
++#endif
+ }
+ 
+ bool RenderCompositorNativeSWGL::MakeCurrent() {
+   wr_swgl_make_current(mContext);
++#if defined(MOZ_IOS_LEGACY)
++  if (mGpu && SwglGpuEAGLMakeCurrent(mGpu) && !mGpuAttached) {
++    mGpuAttached = SwglGpuAttach(mGpu);
++    char describe[256];
++    SwglGpuDescribe(describe, sizeof(describe));
++    printf_stderr("LegacyFox: SWGL pixel shading on the GPU %s: %s\n",
++                  mGpuAttached ? "on" : "refused", describe);
++    if (!mGpuAttached) {
++      SwglGpuEAGLDestroy(mGpu);
++      mGpu = nullptr;
++    }
++  }
++#endif
+   return true;
+ }
+ 
++#if defined(MOZ_IOS_LEGACY)
++void RenderCompositorNativeSWGL::DoFlush() {
++  if (!mGpuAttached) {
++    return;
++  }
++  SwglGpuFinish();
++  // LF_SWGL_GPU_STATS=1: the GPU path's counters every 60 frames.
++  static const bool stats = getenv("LF_SWGL_GPU_STATS");
++  if (stats && ++mGpuFrames % 60 == 0) {
++    uint32_t s[8];
++    SwglGpuStats(s);
++    printf_stderr(
++        "LegacyFox: SWGL GPU draws %u, CPU draws %u, quads %u, uploads %u, "
++        "readbacks %u, clears %u, refused program %u, state %u\n",
++        s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]);
++  }
++}
++#endif
++
+ bool RenderCompositorNativeSWGL::InitDefaultFramebuffer(
+     const gfx::IntRect& aBounds) {
+   if (mNativeLayerForEntireWindow) {
+@@ -723,6 +775,26 @@ bool RenderCompositorNativeSWGL::MapTile(wr::NativeTileId aId,
+   gfx::IntRect validRect(aValidRect.min.x, aValidRect.min.y, aValidRect.width(),
+                          aValidRect.height());
+   BindNativeLayer(aId, dirtyRect);
++#if defined(MOZ_IOS_LEGACY)
++  if (mGpuAttached && mCurrentlyBoundNativeLayer->AsNativeLayerCA()) {
++    CFTypeRefPtr<IOSurfaceRef> surface =
++        mCurrentlyBoundNativeLayer->AsNativeLayerCA()->NextSurfaceAsIOSurface(
++            validRect, gfx::IntRegion(dirtyRect));
++    uint32_t texture = surface ? SwglGpuEAGLTexture(mGpu, surface.get()) : 0;
++    if (!texture) {
++      UnbindNativeLayer();
++      return false;
++    }
++    mGpuTile.texture = texture;
++    mGpuTile.width = int32_t(IOSurfaceGetWidth(surface.get()));
++    mGpuTile.height = int32_t(IOSurfaceGetHeight(surface.get()));
++    mGpuTileMapped = true;
++    // A negative stride says the tile is a GPU texture (sw_compositor.rs).
++    *aData = &mGpuTile;
++    *aStride = -1;
++    return true;
++  }
++#endif
+   if (!MapNativeLayer(mCurrentlyBoundNativeLayer, dirtyRect, validRect)) {
+     UnbindNativeLayer();
+     return false;
+@@ -733,6 +805,13 @@ bool RenderCompositorNativeSWGL::MapTile(wr::NativeTileId aId,
+ }
+ 
+ void RenderCompositorNativeSWGL::UnmapTile() {
++#if defined(MOZ_IOS_LEGACY)
++  if (mGpuTileMapped) {
++    mGpuTileMapped = false;
++    UnbindNativeLayer();
++    return;
++  }
++#endif
+   if (!mNativeLayerForEntireWindow && mCurrentlyBoundNativeLayer) {
+     UnmapNativeLayer();
+     UnbindNativeLayer();
+diff --git a/gfx/webrender_bindings/RenderCompositorNative.h b/gfx/webrender_bindings/RenderCompositorNative.h
+index 150f6d6fac..0ac446dfc9 100644
+--- a/gfx/webrender_bindings/RenderCompositorNative.h
++++ b/gfx/webrender_bindings/RenderCompositorNative.h
+@@ -239,6 +239,21 @@ class RenderCompositorNativeSWGL : public RenderCompositorNative {
+   void UnmapNativeLayer();
+ 
+   void* mContext = nullptr;
++#if defined(MOZ_IOS_LEGACY)
++  // Before the layers go to the screen: the GPU is done drawing into them.
++  void DoFlush() override;
++  // Pixel shading on the GPU (swgl's gpu_gles2.h), when it is on: the GL
++  // context, whether SWGL took it, and the tile mapped for it.
++  struct SwglGpuEAGL* mGpu = nullptr;
++  bool mGpuAttached = false;
++  bool mGpuTileMapped = false;
++  struct {
++    uint32_t texture;
++    int32_t width;
++    int32_t height;
++  } mGpuTile = {};
++  uint32_t mGpuFrames = 0;
++#endif
+   RefPtr<gfx::DrawTarget> mLayerTarget;
+   uint8_t* mLayerData = nullptr;
+   uint8_t* mLayerValidRectData = nullptr;
+diff --git a/gfx/webrender_bindings/RenderCompositorSWGLGPU.h b/gfx/webrender_bindings/RenderCompositorSWGLGPU.h
+new file mode 100644
+index 0000000000..c0ca1f0d7f
+--- /dev/null
++++ b/gfx/webrender_bindings/RenderCompositorSWGLGPU.h
+@@ -0,0 +1,40 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#ifndef MOZILLA_GFX_RENDERCOMPOSITOR_SWGL_GPU_H
++#define MOZILLA_GFX_RENDERCOMPOSITOR_SWGL_GPU_H
++
++// An OpenGL ES 2 context for SWGL's pixel shading on legacy iOS (gpu_gles2.h
++// in swgl), and GL textures over the IOSurfaces of compositor tiles.
++
++#include <stdint.h>
++#include <IOSurface/IOSurfaceRef.h>
++
++namespace mozilla::wr {
++
++struct SwglGpuEAGL;
++
++// Null if the device has no OpenGL ES 2 or cannot bind IOSurfaces.
++SwglGpuEAGL* SwglGpuEAGLCreate();
++bool SwglGpuEAGLMakeCurrent(SwglGpuEAGL* aGpu);
++void SwglGpuEAGLDestroy(SwglGpuEAGL* aGpu);
++// A texture of the current context that is aSurface; 0 on failure.
++uint32_t SwglGpuEAGLTexture(SwglGpuEAGL* aGpu, IOSurfaceRef aSurface);
++
++}  // namespace mozilla::wr
++
++extern "C" {
++// swgl's gpu_gles2.h.
++struct SwglGpuGLTile {
++  uint32_t texture;
++  int32_t width;
++  int32_t height;
++};
++bool SwglGpuAttach(void* current);
++void SwglGpuDescribe(char* out, size_t size);
++void SwglGpuFinish();
++void SwglGpuStats(uint32_t* out8);
++}
++
++#endif
+diff --git a/gfx/webrender_bindings/RenderCompositorSWGLGPU.mm b/gfx/webrender_bindings/RenderCompositorSWGLGPU.mm
+new file mode 100644
+index 0000000000..564549da98
+--- /dev/null
++++ b/gfx/webrender_bindings/RenderCompositorSWGLGPU.mm
+@@ -0,0 +1,119 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#include "RenderCompositorSWGLGPU.h"
++
++#import <OpenGLES/EAGL.h>
++#import <OpenGLES/ES2/gl.h>
++#import <OpenGLES/ES2/glext.h>
++
++#include <vector>
++
++// The iOS 5-10 form of EAGLContext's IOSurface binding; iOS 11 made public
++// one without `invert`.
++@interface EAGLContext (LegacyFoxIOSurfaceInvert)
++- (BOOL)texImageIOSurface:(IOSurfaceRef)ioSurface
++                   target:(NSUInteger)target
++           internalFormat:(NSUInteger)internalFormat
++                    width:(uint32_t)width
++                   height:(uint32_t)height
++                   format:(NSUInteger)format
++                     type:(NSUInteger)type
++                    plane:(uint32_t)plane
++                   invert:(BOOL)invert;
++@end
++
++namespace mozilla::wr {
++
++struct SwglGpuEAGL {
++  EAGLContext* mContext = nil;
++  struct Entry {
++    IOSurfaceRef mSurface;
++    uint32_t mId;
++    GLuint mTexture;
++    uint64_t mLastUse;
++  };
++  std::vector<Entry> mTextures;
++  uint64_t mUse = 0;
++};
++
++// Tiles come in a few sizes and a three-deep swap chain each; textures for
++// surfaces gone from the pool are dropped as new ones come.
++static const size_t kMaxTextures = 48;
++
++SwglGpuEAGL* SwglGpuEAGLCreate() {
++  EAGLContext* context =
++      [[EAGLContext alloc] initWithAPI:kEAGLRenderingAPIOpenGLES2];
++  if (!context ||
++      ![context respondsToSelector:@selector
++                (texImageIOSurface:target:internalFormat:width:height:format:type:plane:invert:)]) {
++    [context release];
++    return nullptr;
++  }
++  SwglGpuEAGL* gpu = new SwglGpuEAGL;
++  gpu->mContext = context;
++  return gpu;
++}
++
++bool SwglGpuEAGLMakeCurrent(SwglGpuEAGL* aGpu) {
++  return [EAGLContext setCurrentContext:aGpu->mContext];
++}
++
++void SwglGpuEAGLDestroy(SwglGpuEAGL* aGpu) {
++  if (!aGpu) {
++    return;
++  }
++  [EAGLContext setCurrentContext:aGpu->mContext];
++  for (auto& e : aGpu->mTextures) {
++    glDeleteTextures(1, &e.mTexture);
++  }
++  [EAGLContext setCurrentContext:nil];
++  [aGpu->mContext release];
++  delete aGpu;
++}
++
++uint32_t SwglGpuEAGLTexture(SwglGpuEAGL* aGpu, IOSurfaceRef aSurface) {
++  uint32_t id = IOSurfaceGetID(aSurface);
++  aGpu->mUse++;
++  for (auto& e : aGpu->mTextures) {
++    if (e.mSurface == aSurface && e.mId == id) {
++      e.mLastUse = aGpu->mUse;
++      return e.mTexture;
++    }
++  }
++  if (aGpu->mTextures.size() >= kMaxTextures) {
++    auto oldest = aGpu->mTextures.begin();
++    for (auto it = aGpu->mTextures.begin(); it != aGpu->mTextures.end(); ++it) {
++      if (it->mLastUse < oldest->mLastUse) {
++        oldest = it;
++      }
++    }
++    glDeleteTextures(1, &oldest->mTexture);
++    aGpu->mTextures.erase(oldest);
++  }
++  GLuint tex = 0;
++  glGenTextures(1, &tex);
++  glBindTexture(GL_TEXTURE_2D, tex);
++  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++  BOOL ok = [aGpu->mContext texImageIOSurface:aSurface
++                                       target:GL_TEXTURE_2D
++                               internalFormat:GL_RGBA
++                                        width:uint32_t(IOSurfaceGetWidth(aSurface))
++                                       height:uint32_t(IOSurfaceGetHeight(aSurface))
++                                       format:GL_BGRA_EXT
++                                         type:GL_UNSIGNED_BYTE
++                                        plane:0
++                                       invert:NO];
++  if (!ok) {
++    glDeleteTextures(1, &tex);
++    return 0;
++  }
++  aGpu->mTextures.push_back({aSurface, id, tex, aGpu->mUse});
++  return tex;
++}
++
++}  // namespace mozilla::wr
+diff --git a/gfx/webrender_bindings/moz.build b/gfx/webrender_bindings/moz.build
+index 94600530b6..4fd50c7fe8 100644
+--- a/gfx/webrender_bindings/moz.build
++++ b/gfx/webrender_bindings/moz.build
+@@ -60,6 +60,10 @@ if CONFIG["MOZ_WIDGET_TOOLKIT"] in ("cocoa", "uikit"):
+         "RenderCompositorNative.cpp",
+         "RenderMacIOSurfaceTextureHost.cpp",
+     ]
++    if CONFIG["MOZ_IOS_LEGACY"]:
++        SOURCES += [
++            "RenderCompositorSWGLGPU.mm",
++        ]
+ 
+ if CONFIG["MOZ_WIDGET_TOOLKIT"] == "android":
+     EXPORTS.mozilla.webrender += [
+diff --git a/gfx/wr/glsl-to-cxx/src/hlsl.rs b/gfx/wr/glsl-to-cxx/src/hlsl.rs
+index 27915ad782..70a3a53b03 100644
+--- a/gfx/wr/glsl-to-cxx/src/hlsl.rs
++++ b/gfx/wr/glsl-to-cxx/src/hlsl.rs
+@@ -1692,9 +1692,13 @@ pub fn translate_fragment_dialect(
+     }
+ 
+     if essl {
++        // By number, which is how the GPU path finds them; the shader's own
++        // names stand for them.
+         for (i, (name, kind)) in samplers.iter().enumerate() {
+-            em.line(&format!("uniform sampler2D {};", name));
+-            em.line(&format!("uniform vec4 {}_size;", name));
++            em.line(&format!("uniform sampler2D glsl_s{};", i));
++            em.line(&format!("uniform vec4 glsl_size{};", i));
++            em.line(&format!("#define {} glsl_s{}", name, i));
++            em.line(&format!("#define {}_size glsl_size{}", name, i));
+             layout.samplers.push(Sampler { name: name.clone(), kind: *kind, register: i });
+         }
+         layout.flat_register = samplers.len();
+diff --git a/gfx/wr/glsl-to-cxx/src/lib.rs b/gfx/wr/glsl-to-cxx/src/lib.rs
+index 54ebad9156..8966ed3a77 100644
+--- a/gfx/wr/glsl-to-cxx/src/lib.rs
++++ b/gfx/wr/glsl-to-cxx/src/lib.rs
+@@ -2996,7 +2996,8 @@ fn case_stmts_to_if_stmts(stmts: &[Statement], last: bool) -> (Option<Box<Statem
+                     statement_list: Vec::new(),
+                 },
+                 _ => {
+-                    if last {
++                    // A return ends the case as a break would.
++                    if last || matches!(**s, hir::SimpleStatement::Jump(hir::JumpStatement::Return(_))) {
+                         // we don't need a break at the end
+                         hir::CompoundStatement {
+                             statement_list: vec![hir::Statement::Simple(s.clone())],
+diff --git a/gfx/wr/swgl/build.rs b/gfx/wr/swgl/build.rs
+index 4f6edadc2e..8d6977a881 100644
+--- a/gfx/wr/swgl/build.rs
++++ b/gfx/wr/swgl/build.rs
+@@ -168,7 +168,9 @@ fn translate_shader(
+     };
+     // YUV: the GPU dialect's colour-matrix code needs matrix operations SWGL's
+     // C++ runtime lacks. Video reaches the compositor as its own surfaces.
+-    if std::env::var("SWGL_GPU_NO_YUV").is_ok() && (shader_key.contains("YUV") || shader_key.contains("yuv")) {
++    if (essl || std::env::var("SWGL_GPU_NO_YUV").is_ok())
++        && (shader_key.contains("YUV") || shader_key.contains("yuv"))
++    {
+         return false;
+     }
+     // Shaders glsl-to-cxx cannot take outside SWGL's dialect just have no GPU
+@@ -499,6 +501,7 @@ fn main() {
+     println!("cargo:rerun-if-changed=src/vector_type.h");
+     println!("cargo:rerun-if-changed=src/gl.cc");
+     println!("cargo:rerun-if-changed=src/gpu_d3d11.h");
++    println!("cargo:rerun-if-changed=src/gpu_gles2.h");
+     let mut build = cc::Build::new();
+     build.cpp(true);
+ 
+diff --git a/gfx/wr/swgl/src/gl.cc b/gfx/wr/swgl/src/gl.cc
+index 4b0964347c..8f54d74986 100644
+--- a/gfx/wr/swgl/src/gl.cc
++++ b/gfx/wr/swgl/src/gl.cc
+@@ -32,6 +32,16 @@
+ // comes Direct3D 11 (gpu_d3d11.h), whose headers need Windows.h; it goes in
+ // first, before anything of SWGL's own can collide with it.
+ #  include "gpu_shaders.h"
++#elif defined(__APPLE__)
++// The OpenGL ES 2 pixel shaders' switch (gpu_gles2.h), and what that needs
++// of the standard library, before glsl.h renames the maths functions.
++#  include "gpu_shaders.h"
++#  if SWGL_GPU_ESSL
++#    include <algorithm>
++#    include <string>
++#    include <unordered_map>
++#    include <vector>
++#  endif
+ #endif
+ 
+ #if defined(_WIN32) && SWGL_GPU_SHADERS
+@@ -3149,6 +3159,7 @@ void CopyTexSubImage2D(GLenum target, UNUSED GLint level, GLint xoffset,
+ 
+ #include "rasterize.h"
+ 
++#include "gpu_gles2.h"
+ #include "gpu_d3d11.h"
+ 
+ void VertexArray::validate() {
+diff --git a/gfx/wr/swgl/src/gpu_d3d11.h b/gfx/wr/swgl/src/gpu_d3d11.h
+index 100dadae70..b0525e781f 100644
+--- a/gfx/wr/swgl/src/gpu_d3d11.h
++++ b/gfx/wr/swgl/src/gpu_d3d11.h
+@@ -2143,7 +2143,7 @@ void SwglGpuMemoryStats(uint32_t* out5) {
+ 
+ }  // extern "C"
+ 
+-#else  // no GPU path on this platform
++#elif !SWGL_GPU_ESSL  // no GPU path on this platform
+ 
+ struct GpuTex {};
+ struct GpuBackend {};
+diff --git a/gfx/wr/swgl/src/gpu_gles2.h b/gfx/wr/swgl/src/gpu_gles2.h
+new file mode 100644
+index 0000000000..f1d887d664
+--- /dev/null
++++ b/gfx/wr/swgl/src/gpu_gles2.h
+@@ -0,0 +1,1673 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++// Pixel shading on an OpenGL ES 2 GPU: the GPU path of gpu_d3d11.h for
++// devices such as the PowerVR SGX of A4-A6 iOS devices, which have no vertex
++// texture fetch (so no WebRender of their own) but shade pixels many times
++// faster than their CPUs. The design and the bookkeeping are gpu_d3d11.h's:
++// SWGL runs the vertex shaders on the CPU, the GPU rasterises and shades the
++// quads into GPU copies of SWGL's textures, and two flags per texture say
++// which copy is newer. The fragment shaders are GLSL ES 1.0 (glsl-to-cxx's
++// essl dialect), compiled on the device the first time a program is used.
++//
++// Rows: GL's row 0 is SWGL's row 0, so viewports, scissors and memory
++// layouts carry over without flipping.
++//
++// The GL context must be current on the thread that uses the SWGL context;
++// the caller makes it so (SwglGpuAttach).
++
++#if SWGL_GPU_SHADERS && SWGL_GPU_ESSL
++
++#  define SWGL_GPU 1
++
++// The OpenGL ES 2 entry points, declared here: SWGL defines GL's names and
++// types itself, and the system's gl.h would collide with them.
++extern "C" {
++void glActiveTexture(GLenum);
++void glAttachShader(GLuint, GLuint);
++void glBindAttribLocation(GLuint, GLuint, const char*);
++void glBindBuffer(GLenum, GLuint);
++void glBindFramebuffer(GLenum, GLuint);
++void glBindRenderbuffer(GLenum, GLuint);
++void glBindTexture(GLenum, GLuint);
++void glBlendColor(float, float, float, float);
++void glBlendEquation(GLenum);
++void glBlendFuncSeparate(GLenum, GLenum, GLenum, GLenum);
++void glBufferData(GLenum, intptr_t, const void*, GLenum);
++GLenum glCheckFramebufferStatus(GLenum);
++void glClear(GLbitfield);
++void glClearColor(float, float, float, float);
++void glClearDepthf(float);
++void glColorMask(GLboolean, GLboolean, GLboolean, GLboolean);
++void glCompileShader(GLuint);
++void glCopyTexSubImage2D(GLenum, GLint, GLint, GLint, GLint, GLint, GLsizei,
++                         GLsizei);
++GLuint glCreateProgram(void);
++GLuint glCreateShader(GLenum);
++void glDeleteBuffers(GLsizei, const GLuint*);
++void glDeleteFramebuffers(GLsizei, const GLuint*);
++void glDeleteProgram(GLuint);
++void glDeleteRenderbuffers(GLsizei, const GLuint*);
++void glDeleteShader(GLuint);
++void glDeleteTextures(GLsizei, const GLuint*);
++void glDepthFunc(GLenum);
++void glDepthMask(GLboolean);
++void glDisable(GLenum);
++void glDisableVertexAttribArray(GLuint);
++void glDrawElements(GLenum, GLsizei, GLenum, const void*);
++void glEnable(GLenum);
++void glEnableVertexAttribArray(GLuint);
++void glFinish(void);
++void glFlush(void);
++void glFramebufferRenderbuffer(GLenum, GLenum, GLenum, GLuint);
++void glFramebufferTexture2D(GLenum, GLenum, GLenum, GLuint, GLint);
++void glGenBuffers(GLsizei, GLuint*);
++void glGenFramebuffers(GLsizei, GLuint*);
++void glGenRenderbuffers(GLsizei, GLuint*);
++void glGenTextures(GLsizei, GLuint*);
++GLenum glGetError(void);
++void glGetIntegerv(GLenum, GLint*);
++void glGetProgramInfoLog(GLuint, GLsizei, GLsizei*, char*);
++void glGetProgramiv(GLuint, GLenum, GLint*);
++void glGetShaderInfoLog(GLuint, GLsizei, GLsizei*, char*);
++void glGetShaderiv(GLuint, GLenum, GLint*);
++const unsigned char* glGetString(GLenum);
++GLint glGetUniformLocation(GLuint, const char*);
++void glLinkProgram(GLuint);
++void glPixelStorei(GLenum, GLint);
++void glReadPixels(GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void*);
++void glRenderbufferStorage(GLenum, GLenum, GLsizei, GLsizei);
++void glScissor(GLint, GLint, GLsizei, GLsizei);
++void glShaderSource(GLuint, GLsizei, const char* const*, const GLint*);
++void glTexImage2D(GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLenum, GLenum,
++                  const void*);
++void glTexParameteri(GLenum, GLenum, GLint);
++void glTexSubImage2D(GLenum, GLint, GLint, GLint, GLsizei, GLsizei, GLenum,
++                     GLenum, const void*);
++void glUniform1i(GLint, GLint);
++void glUniform4f(GLint, float, float, float, float);
++void glUseProgram(GLuint);
++void glVertexAttribPointer(GLuint, GLint, GLenum, GLboolean, GLsizei,
++                           const void*);
++void glViewport(GLint, GLint, GLsizei, GLsizei);
++}
++
++namespace swgl_gpu {
++
++static const GLenum ES_BGRA = 0x80E1;            // GL_BGRA_EXT
++static const GLenum ES_RED = 0x1903;             // GL_RED_EXT
++static const GLenum ES_STREAM_DRAW = 0x88E0;
++static const GLenum ES_STATIC_DRAW = 0x88E4;
++static const GLenum ES_COMPILE_STATUS = 0x8B81;
++static const GLenum ES_LINK_STATUS = 0x8B82;
++static const GLenum ES_CULL_FACE = 0x0B44;
++static const GLenum ES_DITHER = 0x0BD0;
++static const GLenum ES_DEPTH24 = 0x81A6;  // GL_DEPTH_COMPONENT24_OES
++static const GLenum ES_DEPTH16 = 0x81A5;
++static const GLenum ES_PACK_ALIGNMENT = 0x0D05;
++
++// SWGL_GPU_TRACE=1: a line on stderr for every draw, clear, upload and
++// readback.
++static bool trace() {
++  static int on = -1;
++  if (on < 0) on = getenv("SWGL_GPU_TRACE") ? 1 : 0;
++  return on == 1;
++}
++
++static const int MAX_QUADS_PER_FLUSH = 2048;
++static const int FLAT_TEX_WIDTH = 1024;
++static const int FLAT_TEX_HEIGHT = 64;
++static const int MAX_SAMPLERS = 8;
++
++static int64_t resident_bytes = 0;
++static int64_t gpu_tex_bytes = 0;
++static int64_t gpu_cache_bytes = 0;
++
++}  // namespace swgl_gpu
++
++// The GPU side of one SWGL texture.
++struct GpuTex {
++  GLuint tex = 0;
++  // A depth texture is a renderbuffer.
++  GLuint rb = 0;
++  // Its framebuffer, made when it is first drawn into.
++  GLuint fbo = 0;
++  GLuint fbo_depth = 0;
++  GLenum internal_format = 0;
++  int width = 0;
++  int height = 0;
++  bool gpu_newer = false;
++  bool cpu_newer = true;
++  // An R8 texture stored as BGRA, where the GPU cannot render red alone.
++  bool expanded = false;
++  // A compositor tile's texture, which belongs to someone else; this SWGL
++  // texture is its rectangle at (ox, oy).
++  bool external = false;
++  int ox = 0;
++  int oy = 0;
++  bool resident = false;
++  int tex_w = 0;
++  int tex_h = 0;
++  GLenum filter = 0;
++  // A depth value the CPU's depth runs hold everywhere, to clear the
++  // renderbuffer to when it is next attached; negative for none.
++  float pending_depth = -1.0f;
++  int64_t resident_size = 0;
++  int64_t gpu_size = 0;
++
++  void release() {
++    if (resident) {
++      swgl_gpu::resident_bytes -= resident_size;
++      resident_size = 0;
++    }
++    swgl_gpu::gpu_tex_bytes -= gpu_size;
++    gpu_size = 0;
++    if (fbo) glDeleteFramebuffers(1, &fbo);
++    if (tex && !external) glDeleteTextures(1, &tex);
++    if (rb) glDeleteRenderbuffers(1, &rb);
++    fbo = tex = rb = fbo_depth = 0;
++    width = height = 0;
++    tex_w = tex_h = 0;
++    filter = 0;
++    external = false;
++    resident = false;
++    ox = oy = 0;
++  }
++  ~GpuTex() { release(); }
++};
++
++namespace swgl_gpu {
++
++static void mark_resident(GpuTex& gt, const Texture& t) {
++  if (gt.resident) return;
++  gt.resident = true;
++  gt.resident_size =
++      int64_t(t.width) * t.height * (t.internal_format == GL_R8 ? 1 : 4);
++  resident_bytes += gt.resident_size;
++}
++
++static void unmark_resident(GpuTex& gt) {
++  if (!gt.resident) return;
++  gt.resident = false;
++  resident_bytes -= gt.resident_size;
++  gt.resident_size = 0;
++}
++
++}  // namespace swgl_gpu
++
++// A pixel shader compiled and linked with the pass-through vertex shader.
++struct GpuProgram {
++  GLuint prog = 0;
++  GLint sampler_size[swgl_gpu::MAX_SAMPLERS];
++  GLint flat_size = -1;
++};
++
++struct GpuBackend {
++  bool red_ok = false;
++  bool float_ok = false;
++  bool minmax_ok = false;
++  bool depth24_ok = false;
++  int max_texture = 2048;
++
++  GLuint vs[9] = {};
++  GLuint copy_prog = 0;
++  Texture* scratch = nullptr;
++  bool recording = false;
++  std::vector<float> recorded;
++
++  GLuint vb = 0;
++  GLuint ib = 0;
++  GLuint flat_tex = 0;
++  GLuint empty_tex = 0;
++  // A framebuffer for reading textures that are not render targets.
++  GLuint read_fbo = 0;
++
++  std::unordered_map<const GpuProgramInfo*, GpuProgram> programs;
++  std::unordered_map<const GpuProgramInfo*, bool> refused;
++
++  std::vector<float> verts;
++  std::vector<float> flats;
++  std::vector<char> interps;
++  std::vector<uint8_t> rows;
++
++  // Copies of render targets that a draw also samples.
++  struct Feedback {
++    GLuint tex;
++    GLenum format;
++    int w, h;
++  };
++  std::vector<Feedback> feedback;
++
++  bool broken = false;
++
++  struct Stats {
++    uint32_t gpu_draws = 0;
++    uint32_t cpu_draws = 0;
++    uint32_t gpu_quads = 0;
++    uint32_t uploads = 0;
++    uint32_t readbacks = 0;
++    uint32_t gpu_clears = 0;
++    uint32_t refused_program = 0;
++    uint32_t refused_state = 0;
++    uint32_t depth_lost = 0;
++    uint32_t cpu_freed = 0;
++    uint32_t cpu_restored = 0;
++  } stats;
++
++  ~GpuBackend() {
++    delete scratch;
++    for (auto& v : vs) {
++      if (v) glDeleteShader(v);
++    }
++    if (copy_prog) glDeleteProgram(copy_prog);
++    for (auto& p : programs) glDeleteProgram(p.second.prog);
++    if (vb) glDeleteBuffers(1, &vb);
++    if (ib) glDeleteBuffers(1, &ib);
++    if (flat_tex) glDeleteTextures(1, &flat_tex);
++    if (empty_tex) glDeleteTextures(1, &empty_tex);
++    if (read_fbo) glDeleteFramebuffers(1, &read_fbo);
++    for (auto& f : feedback) glDeleteTextures(1, &f.tex);
++  }
++};
++
++namespace swgl_gpu {
++
++static GLuint compile_shader(GLenum type, const char* src, const char* name) {
++  GLuint s = glCreateShader(type);
++  glShaderSource(s, 1, &src, nullptr);
++  glCompileShader(s);
++  GLint ok = 0;
++  glGetShaderiv(s, ES_COMPILE_STATUS, &ok);
++  if (!ok) {
++    char log[1024] = "";
++    glGetShaderInfoLog(s, sizeof(log), nullptr, log);
++    fprintf(stderr, "gpu: %s does not compile: %s\n", name, log);
++    glDeleteShader(s);
++    return 0;
++  }
++  return s;
++}
++
++static GLuint link_program(GLuint vs, GLuint fs, int slots, const char* name) {
++  GLuint p = glCreateProgram();
++  glAttachShader(p, vs);
++  glAttachShader(p, fs);
++  glBindAttribLocation(p, 0, "glsl_pos");
++  char buf[16];
++  for (int i = 0; i < slots; i++) {
++    snprintf(buf, sizeof(buf), "glsl_a%d", i);
++    glBindAttribLocation(p, i + 1, buf);
++  }
++  glLinkProgram(p);
++  GLint ok = 0;
++  glGetProgramiv(p, ES_LINK_STATUS, &ok);
++  if (!ok) {
++    char log[1024] = "";
++    glGetProgramInfoLog(p, sizeof(log), nullptr, log);
++    fprintf(stderr, "gpu: %s does not link: %s\n", name, log);
++    glDeleteProgram(p);
++    return 0;
++  }
++  return p;
++}
++
++static bool has_extension(const char* exts, const char* e) {
++  size_t n = strlen(e);
++  for (const char* p = exts; p && (p = strstr(p, e)); p += n) {
++    if ((p == exts || p[-1] == ' ') && (p[n] == ' ' || p[n] == 0)) return true;
++  }
++  return false;
++}
++
++static void set_filter(GLuint tex, GLenum filter) {
++  glBindTexture(GL_TEXTURE_2D, tex);
++  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
++  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
++  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++}
++
++static bool init_backend(GpuBackend* g) {
++  const char* exts = (const char*)glGetString(GL_EXTENSIONS);
++  g->red_ok = has_extension(exts, "GL_EXT_texture_rg");
++  g->float_ok = has_extension(exts, "GL_OES_texture_float");
++  g->minmax_ok = has_extension(exts, "GL_EXT_blend_minmax");
++  g->depth24_ok = has_extension(exts, "GL_OES_depth24");
++  GLint max = 0;
++  glGetIntegerv(GL_MAX_TEXTURE_SIZE, &max);
++  if (max > 0) g->max_texture = max;
++
++  for (int slots = 1; slots <= 8; slots++) {
++    std::string src = "attribute vec4 glsl_pos;\n";
++    char buf[96];
++    for (int i = 0; i < slots; i++) {
++      snprintf(buf, sizeof(buf),
++               "attribute vec4 glsl_a%d;\nvarying vec4 glsl_t%d;\n", i, i);
++      src += buf;
++    }
++    src += "void main() {\n gl_Position = glsl_pos;\n";
++    for (int i = 0; i < slots; i++) {
++      snprintf(buf, sizeof(buf), " glsl_t%d = glsl_a%d;\n", i, i);
++      src += buf;
++    }
++    src += "}\n";
++    g->vs[slots] = compile_shader(GL_VERTEX_SHADER, src.c_str(), "vertex stage");
++    if (!g->vs[slots]) return false;
++  }
++  // Pixels the CPU shaded, placed by the GPU: texture coordinate (u w, v w,
++  // 0, w), divided here so that perspective quads line up.
++  GLuint copy_fs = compile_shader(
++      GL_FRAGMENT_SHADER,
++      "precision highp float;\nvarying vec4 glsl_t0;\nuniform sampler2D "
++      "glsl_tex;\nvoid main() { gl_FragColor = texture2D(glsl_tex, glsl_t0.xy "
++      "/ glsl_t0.w); }\n",
++      "copy");
++  if (!copy_fs) return false;
++  g->copy_prog = link_program(g->vs[1], copy_fs, 1, "copy");
++  glDeleteShader(copy_fs);
++  if (!g->copy_prog) return false;
++
++  glGenBuffers(1, &g->vb);
++  // SWGL's vertex stage leaves a quad's corners in the order they go round
++  // the polygon, so the quad is the fan 0 1 2, 0 2 3.
++  {
++    std::vector<uint16_t> idx(MAX_QUADS_PER_FLUSH * 6);
++    for (int q = 0; q < MAX_QUADS_PER_FLUSH; q++) {
++      uint16_t b = uint16_t(q * 4);
++      uint16_t* o = &idx[q * 6];
++      o[0] = b;
++      o[1] = b + 1;
++      o[2] = b + 2;
++      o[3] = b;
++      o[4] = b + 2;
++      o[5] = b + 3;
++    }
++    glGenBuffers(1, &g->ib);
++    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g->ib);
++    glBufferData(GL_ELEMENT_ARRAY_BUFFER, intptr_t(idx.size() * 2), idx.data(),
++                 ES_STATIC_DRAW);
++  }
++  if (g->float_ok) {
++    glGenTextures(1, &g->flat_tex);
++    set_filter(g->flat_tex, GL_NEAREST);
++    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, FLAT_TEX_WIDTH, FLAT_TEX_HEIGHT, 0,
++                 GL_RGBA, GL_FLOAT, nullptr);
++    if (glGetError()) {
++      glDeleteTextures(1, &g->flat_tex);
++      g->flat_tex = 0;
++    }
++  }
++  {
++    // What a sampler with no texture behind it reads, as in GL: (0, 0, 0, 1).
++    glGenTextures(1, &g->empty_tex);
++    set_filter(g->empty_tex, GL_NEAREST);
++    uint32_t black = 0xFF000000;
++    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE,
++                 &black);
++  }
++  glGenFramebuffers(1, &g->read_fbo);
++  return glGetError() == 0;
++}
++
++// Whether a texture of this format can be the GPU's render target.
++static inline bool renderable(GLenum internal_format) {
++  return internal_format == GL_RGBA8 || internal_format == GL_R8;
++}
++
++static inline bool format_on_gpu(GpuBackend* g, GLenum internal_format) {
++  switch (internal_format) {
++    case GL_RGBA8:
++    case GL_R8:
++    case GL_DEPTH_COMPONENT24:
++      return true;
++    case GL_RGBA32F:
++    case GL_RGBA32I:
++      return g->float_ok;
++    default:
++      return false;
++  }
++}
++
++static int64_t texel_bytes(GLenum internal_format, bool expanded, int64_t w,
++                           int64_t h) {
++  int b = internal_format == GL_R8 && !expanded            ? 1
++          : internal_format == GL_RGBA32F ||
++                  internal_format == GL_RGBA32I            ? 16
++                                                           : 4;
++  return w * h * b;
++}
++
++// Makes sure t has a GPU copy of the right size and format. Returns false if
++// its format has no place on this device.
++static bool ensure_resource(GpuBackend* g, Texture& t, int min_w = 0,
++                            int min_h = 0) {
++  if (!t.gpu) t.gpu = new GpuTex;
++  GpuTex& gt = *t.gpu;
++  if (gt.external) return gt.tex != 0;
++  int want_w = std::max(t.width, min_w);
++  int want_h = std::max(t.height, min_h);
++  bool depth = t.internal_format == GL_DEPTH_COMPONENT24;
++  bool exact = depth && (min_w > 0 || min_h > 0);
++  if ((gt.tex || gt.rb) && gt.width == t.width && gt.height == t.height &&
++      gt.internal_format == t.internal_format &&
++      (exact ? gt.tex_w == want_w && gt.tex_h == want_h
++             : gt.tex_w >= want_w && gt.tex_h >= want_h)) {
++    return true;
++  }
++  bool keep_resident = gt.resident && !t.buf;
++  gt.release();
++  if (keep_resident) mark_resident(gt, t);
++  if (t.width <= 0 || t.height <= 0) return false;
++  if (!format_on_gpu(g, t.internal_format)) return false;
++  if (want_w > g->max_texture || want_h > g->max_texture) return false;
++  glGetError();
++  if (depth) {
++    glGenRenderbuffers(1, &gt.rb);
++    glBindRenderbuffer(GL_RENDERBUFFER, gt.rb);
++    glRenderbufferStorage(GL_RENDERBUFFER,
++                          g->depth24_ok ? ES_DEPTH24 : ES_DEPTH16, want_w,
++                          want_h);
++  } else {
++    glGenTextures(1, &gt.tex);
++    set_filter(gt.tex, GL_NEAREST);
++    gt.filter = GL_NEAREST;
++    gt.expanded = false;
++    switch (t.internal_format) {
++      case GL_RGBA8:
++        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, want_w, want_h, 0, ES_BGRA,
++                     GL_UNSIGNED_BYTE, nullptr);
++        break;
++      case GL_R8:
++        if (g->red_ok) {
++          glTexImage2D(GL_TEXTURE_2D, 0, ES_RED, want_w, want_h, 0, ES_RED,
++                       GL_UNSIGNED_BYTE, nullptr);
++        } else {
++          gt.expanded = true;
++          glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, want_w, want_h, 0, ES_BGRA,
++                       GL_UNSIGNED_BYTE, nullptr);
++        }
++        break;
++      default:
++        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, want_w, want_h, 0, GL_RGBA,
++                     GL_FLOAT, nullptr);
++        break;
++    }
++  }
++  if (glGetError()) {
++    gt.release();
++    return false;
++  }
++  gt.internal_format = t.internal_format;
++  gt.width = t.width;
++  gt.height = t.height;
++  gt.tex_w = want_w;
++  gt.tex_h = want_h;
++  gt.gpu_size = texel_bytes(t.internal_format, gt.expanded, want_w, want_h);
++  gpu_tex_bytes += gt.gpu_size;
++  gt.gpu_newer = false;
++  gt.cpu_newer = !gt.resident;
++  return true;
++}
++
++// The framebuffer that draws into gt (and depth, a renderbuffer, or none).
++static bool bind_target(GpuBackend* g, GpuTex& gt, GpuTex* depth) {
++  if (!gt.fbo) {
++    glGenFramebuffers(1, &gt.fbo);
++    glBindFramebuffer(GL_FRAMEBUFFER, gt.fbo);
++    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
++                           gt.tex, 0);
++    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
++      if (trace()) fprintf(stderr, "gpu: %dx%d is no render target\n", gt.width, gt.height);
++      glDeleteFramebuffers(1, &gt.fbo);
++      gt.fbo = 0;
++      return false;
++    }
++  } else {
++    glBindFramebuffer(GL_FRAMEBUFFER, gt.fbo);
++  }
++  GLuint want = depth ? depth->rb : 0;
++  if (gt.fbo_depth != want) {
++    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
++                              GL_RENDERBUFFER, want);
++    gt.fbo_depth = want;
++    if (want &&
++        glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
++      glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
++                                GL_RENDERBUFFER, 0);
++      gt.fbo_depth = 0;
++      return false;
++    }
++  }
++  return true;
++}
++
++// Writes the rectangle [x0, x1) x [y0, y1) of the CPU buffer into the GPU copy.
++static void upload_rows(GpuBackend* g, Texture& t, int x0, int y0, int x1,
++                        int y1) {
++  GpuTex& gt = *t.gpu;
++  if (!t.buf || x1 <= x0 || y1 <= y0 || !gt.tex) return;
++  int w = x1 - x0;
++  int h = y1 - y0;
++  glBindTexture(GL_TEXTURE_2D, gt.tex);
++  glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
++  // GLES 2 has no unpack row length: whole rows go up as they are, a
++  // narrower rectangle row by row out of a packed copy.
++  auto send = [&](GLenum format, GLenum type, int bpp) {
++    if (x0 == 0 && w == t.width && size_t(t.stride()) == size_t(w) * bpp) {
++      glTexSubImage2D(GL_TEXTURE_2D, 0, gt.ox, y0 + gt.oy, w, h, format, type,
++                      t.sample_ptr(0, y0));
++    } else {
++      g->rows.resize(size_t(w) * h * bpp);
++      for (int y = 0; y < h; y++) {
++        memcpy(&g->rows[size_t(y) * w * bpp], t.sample_ptr(x0, y0 + y),
++               size_t(w) * bpp);
++      }
++      glTexSubImage2D(GL_TEXTURE_2D, 0, x0 + gt.ox, y0 + gt.oy, w, h, format,
++                      type, g->rows.data());
++    }
++  };
++  if (t.internal_format == GL_RGBA8) {
++    send(ES_BGRA, GL_UNSIGNED_BYTE, 4);
++  } else if (t.internal_format == GL_R8 && !gt.expanded) {
++    send(ES_RED, GL_UNSIGNED_BYTE, 1);
++  } else if (t.internal_format == GL_R8) {
++    g->rows.resize(size_t(w) * h * 4);
++    for (int y = 0; y < h; y++) {
++      copy_red_to_bgra8(&g->rows[size_t(y) * w * 4],
++                        (const uint8_t*)t.sample_ptr(x0, y0 + y), w);
++    }
++    glTexSubImage2D(GL_TEXTURE_2D, 0, x0 + gt.ox, y0 + gt.oy, w, h, ES_BGRA,
++                    GL_UNSIGNED_BYTE, g->rows.data());
++  } else if (t.internal_format == GL_RGBA32I) {
++    g->rows.resize(size_t(w) * h * 16);
++    float* f = (float*)g->rows.data();
++    for (int y = 0; y < h; y++) {
++      const int32_t* s = (const int32_t*)t.sample_ptr(x0, y0 + y);
++      for (int i = 0; i < w * 4; i++) f[size_t(y) * w * 4 + i] = float(s[i]);
++    }
++    glTexSubImage2D(GL_TEXTURE_2D, 0, x0, y0, w, h, GL_RGBA, GL_FLOAT, f);
++  } else if (t.internal_format == GL_RGBA32F) {
++    send(GL_RGBA, GL_FLOAT, 16);
++  }
++  g->stats.uploads++;
++  if (trace()) {
++    fprintf(stderr, "gpu: upload %dx%d of %dx%d fmt %x\n", w, h, t.width,
++            t.height, t.internal_format);
++  }
++}
++
++// Copies the GPU copy back into the CPU buffer.
++static void readback(GpuBackend* g, Texture& t) {
++  GpuTex& gt = *t.gpu;
++  if (!t.buf || !gt.tex) return;
++  if (t.internal_format == GL_DEPTH_COMPONENT24) {
++    // GLES 2 reads no depth back. Everything drawn with depth has a GPU
++    // shader, as at 9_3.
++    g->stats.depth_lost++;
++    return;
++  }
++  if (!renderable(t.internal_format)) return;
++  if (gt.fbo) {
++    glBindFramebuffer(GL_FRAMEBUFFER, gt.fbo);
++  } else {
++    glBindFramebuffer(GL_FRAMEBUFFER, g->read_fbo);
++    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
++                           gt.tex, 0);
++  }
++  g->rows.resize(size_t(t.width) * t.height * 4);
++  glPixelStorei(ES_PACK_ALIGNMENT, 1);
++  glReadPixels(gt.ox, gt.oy, t.width, t.height, GL_RGBA, GL_UNSIGNED_BYTE,
++               g->rows.data());
++  for (int y = 0; y < t.height; y++) {
++    const uint8_t* src = &g->rows[size_t(y) * t.width * 4];
++    uint8_t* dst = (uint8_t*)t.sample_ptr(0, y);
++    if (t.internal_format == GL_R8) {
++      for (int x = 0; x < t.width; x++) dst[x] = src[x * 4];
++    } else {
++      for (int x = 0; x < t.width; x++) {
++        dst[x * 4 + 0] = src[x * 4 + 2];
++        dst[x * 4 + 1] = src[x * 4 + 1];
++        dst[x * 4 + 2] = src[x * 4 + 0];
++        dst[x * 4 + 3] = src[x * 4 + 3];
++      }
++    }
++  }
++  g->stats.readbacks++;
++  if (trace()) {
++    fprintf(stderr, "gpu: readback %dx%d fmt %x\n", t.width, t.height,
++            t.internal_format);
++  }
++}
++
++// Fills a rectangle of gt's framebuffer (in its texture's pixels) with a
++// colour, or its depth buffer with a depth.
++static void clear_rect(GpuBackend* g, GpuTex& gt, GpuTex* depth, int x0,
++                       int y0, int x1, int y1, const float* color,
++                       float depth_value) {
++  glEnable(GL_SCISSOR_TEST);
++  glScissor(x0, y0, x1 - x0, y1 - y0);
++  if (depth) {
++    glDepthMask(1);
++    glClearDepthf(depth_value);
++    glClear(GL_DEPTH_BUFFER_BIT);
++  } else {
++    glColorMask(1, 1, 1, 1);
++    glClearColor(color[0], color[1], color[2], color[3]);
++    glClear(GL_COLOR_BUFFER_BIT);
++  }
++}
++
++// Before the GPU reads or draws into t: make the GPU copy current.
++static bool to_gpu(GpuBackend* g, Texture& t) {
++  if (!ensure_resource(g, t)) return false;
++  GpuTex& gt = *t.gpu;
++  if (gt.cpu_newer) {
++    if (t.internal_format == GL_DEPTH_COMPONENT24) {
++      // What SWGL holds is almost always one clear value; the depth buffer
++      // is cleared to it when it is attached (gpu_draw_elements).
++      if (t.cleared() && t.buf) {
++        uint32_t first = 0;
++        for (int y = 0; y < t.height; y++) {
++          DepthRun* row = (DepthRun*)t.sample_ptr(0, y);
++          flatten_depth_runs(row, t.width);
++          const uint32_t* v = (const uint32_t*)row;
++          if (y == 0) first = v[0] & 0xFFFFFF;
++          for (int x = 0; x < t.width; x++) {
++            if ((v[x] & 0xFFFFFF) != first) return false;
++          }
++        }
++        gt.pending_depth = float(first) / float(0xFFFFFF);
++      }
++    } else if (t.delay_clear && renderable(t.internal_format) &&
++               t.delay_clear >= t.height) {
++      uint32_t c = t.clear_val;
++      float color[4];
++      if (t.internal_format == GL_R8) {
++        color[0] = (c & 0xFF) / 255.0f;
++        color[1] = color[2] = 0.0f;
++        color[3] = 1.0f;
++      } else {
++        color[0] = ((c >> 16) & 0xFF) / 255.0f;
++        color[1] = ((c >> 8) & 0xFF) / 255.0f;
++        color[2] = (c & 0xFF) / 255.0f;
++        color[3] = ((c >> 24) & 0xFF) / 255.0f;
++      }
++      if (!bind_target(g, gt, nullptr)) return false;
++      clear_rect(g, gt, nullptr, gt.ox, gt.oy, gt.ox + t.width,
++                 gt.oy + t.height, color, 0);
++      t.disable_delayed_clear();
++      g->stats.gpu_clears++;
++    } else {
++      if (t.delay_clear) prepare_texture(t);
++      upload_rows(g, t, 0, 0, t.width, t.height);
++    }
++    gt.cpu_newer = false;
++  }
++  return true;
++}
++
++static bool blend_supported(GpuBackend* g) {
++  if (!ctx->blend) return true;
++  switch (ctx->blend_equation) {
++    case GL_FUNC_ADD:
++      break;
++    case GL_MIN:
++    case GL_MAX:
++      if (!g->minmax_ok) return false;
++      break;
++    default:
++      return false;
++  }
++  for (GLenum f : {ctx->blendfunc_srgb, ctx->blendfunc_drgb, ctx->blendfunc_sa,
++                   ctx->blendfunc_da}) {
++    switch (f) {
++      case GL_ZERO:
++      case GL_ONE:
++      case GL_SRC_COLOR:
++      case GL_ONE_MINUS_SRC_COLOR:
++      case GL_SRC_ALPHA:
++      case GL_ONE_MINUS_SRC_ALPHA:
++      case GL_DST_ALPHA:
++      case GL_ONE_MINUS_DST_ALPHA:
++      case GL_DST_COLOR:
++      case GL_ONE_MINUS_DST_COLOR:
++      case GL_CONSTANT_COLOR:
++      case GL_ONE_MINUS_CONSTANT_COLOR:
++        break;
++      default:
++        return false;
++    }
++  }
++  return true;
++}
++
++static void set_blend() {
++  if (!ctx->blend) {
++    glDisable(GL_BLEND);
++    return;
++  }
++  glEnable(GL_BLEND);
++  glBlendEquation(ctx->blend_equation);
++  glBlendFuncSeparate(ctx->blendfunc_srgb, ctx->blendfunc_drgb,
++                      ctx->blendfunc_sa, ctx->blendfunc_da);
++  // blendcolor is kept in BGRA order.
++  glBlendColor(ctx->blendcolor[2] / 255.0f, ctx->blendcolor[1] / 255.0f,
++               ctx->blendcolor[0] / 255.0f, ctx->blendcolor[3] / 255.0f);
++}
++
++// A copy of a texture that is also the draw's target, for reading from: GL
++// leaves sampling a texture while drawing into it undefined.
++static GLuint feedback_copy(GpuBackend* g, GpuTex& gt) {
++  GLenum format = gt.internal_format == GL_R8 && !gt.expanded ? ES_RED : GL_RGBA;
++  GpuBackend::Feedback* f = nullptr;
++  for (auto& e : g->feedback) {
++    if (e.format == format && e.w == gt.width && e.h == gt.height) f = &e;
++  }
++  if (!f) {
++    if (g->feedback.size() >= 2) {
++      for (auto& e : g->feedback) {
++        gpu_cache_bytes -= texel_bytes(GL_RGBA8, false, e.w, e.h);
++        glDeleteTextures(1, &e.tex);
++      }
++      g->feedback.clear();
++    }
++    GpuBackend::Feedback n = {0, format, gt.width, gt.height};
++    glGenTextures(1, &n.tex);
++    set_filter(n.tex, GL_NEAREST);
++    glTexImage2D(GL_TEXTURE_2D, 0, format, gt.width, gt.height, 0,
++                 format == ES_RED ? ES_RED : ES_BGRA, GL_UNSIGNED_BYTE, nullptr);
++    gpu_cache_bytes += texel_bytes(GL_RGBA8, false, gt.width, gt.height);
++    g->feedback.push_back(n);
++    f = &g->feedback.back();
++  }
++  // The target's framebuffer is bound: copy out of it.
++  glBindTexture(GL_TEXTURE_2D, f->tex);
++  glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, gt.ox, gt.oy, gt.width,
++                      gt.height);
++  if (trace()) fprintf(stderr, "gpu: feedback copy %dx%d\n", gt.width, gt.height);
++  return f->tex;
++}
++
++static GpuProgram* program_for(GpuBackend* g, const GpuProgramInfo* info) {
++  auto it = g->programs.find(info);
++  if (it != g->programs.end()) return &it->second;
++  if (g->refused.count(info)) return nullptr;
++  GpuProgram p;
++  GLuint fs = compile_shader(GL_FRAGMENT_SHADER, (const char*)info->ps,
++                             info->name);
++  if (fs) {
++    p.prog = link_program(g->vs[info->slots], fs, info->slots, info->name);
++    glDeleteShader(fs);
++  }
++  if (!p.prog) {
++    g->refused[info] = true;
++    return nullptr;
++  }
++  glUseProgram(p.prog);
++  char buf[32];
++  for (int i = 0; i < MAX_SAMPLERS; i++) {
++    p.sampler_size[i] = -1;
++    if (i >= info->num_samplers) continue;
++    snprintf(buf, sizeof(buf), "glsl_s%d", i);
++    glUniform1i(glGetUniformLocation(p.prog, buf), i);
++    snprintf(buf, sizeof(buf), "glsl_size%d", i);
++    p.sampler_size[i] = glGetUniformLocation(p.prog, buf);
++  }
++  if (info->texture_floats > 0) {
++    glUniform1i(glGetUniformLocation(p.prog, "glsl_flat"), info->num_samplers);
++    p.flat_size = glGetUniformLocation(p.prog, "glsl_flat_size");
++  }
++  return &(g->programs[info] = p);
++}
++
++static void set_viewport(GpuTex& gt, Texture& colortex) {
++  // SWGL subtracts the texture's offset after the viewport transform.
++  glViewport(ctx->viewport.x0 - colortex.offset.x + gt.ox,
++             ctx->viewport.y0 - colortex.offset.y + gt.oy,
++             ctx->viewport.width(), ctx->viewport.height());
++  IntRect sc = ctx->apply_scissor(colortex);
++  glEnable(GL_SCISSOR_TEST);
++  glScissor(sc.x0 + gt.ox, sc.y0 + gt.oy, std::max(sc.width(), 0),
++            std::max(sc.height(), 0));
++  glDisable(ES_CULL_FACE);
++  glDisable(ES_DITHER);
++  glColorMask(1, 1, 1, 1);
++}
++
++// Depth for a draw: the renderbuffer attached, any pending clear applied, the
++// test set. False if the depth buffer cannot be on the GPU.
++static bool set_depth(GpuBackend* g, Texture& colortex, Texture* depthtex) {
++  if (!depthtex) {
++    glDisable(GL_DEPTH_TEST);
++    glDepthMask(0);
++    return bind_target(g, *colortex.gpu, nullptr);
++  }
++  if (!bind_target(g, *colortex.gpu, depthtex->gpu)) return false;
++  GpuTex& dt = *depthtex->gpu;
++  if (dt.pending_depth >= 0.0f) {
++    GpuTex& ct = *colortex.gpu;
++    clear_rect(g, ct, &dt, 0, 0, ct.tex_w, ct.tex_h, nullptr, dt.pending_depth);
++    dt.pending_depth = -1.0f;
++    g->stats.gpu_clears++;
++  }
++  glEnable(GL_DEPTH_TEST);
++  glDepthFunc(ctx->depthfunc == GL_LEQUAL ? GL_LEQUAL : GL_LESS);
++  glDepthMask(ctx->depthmask ? 1 : 0);
++  return true;
++}
++
++static void draw_quads(GpuBackend* g, const float* verts, int quads, int slots) {
++  const int vstride = 16 * (1 + slots);
++  glBindBuffer(GL_ARRAY_BUFFER, g->vb);
++  glBufferData(GL_ARRAY_BUFFER, intptr_t(quads) * 4 * vstride, verts,
++               ES_STREAM_DRAW);
++  for (int i = 0; i <= slots; i++) {
++    glEnableVertexAttribArray(i);
++    glVertexAttribPointer(i, 4, GL_FLOAT, 0, vstride, (const void*)intptr_t(16 * i));
++  }
++  for (int i = slots + 1; i <= 8; i++) glDisableVertexAttribArray(i);
++  glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g->ib);
++  glDrawElements(GL_TRIANGLES, quads * 6, GL_UNSIGNED_SHORT, nullptr);
++}
++
++}  // namespace swgl_gpu
++
++namespace swgl_gpu {
++
++// Frees t's CPU buffer when the GPU copy is current (see gpu_d3d11.h).
++static void drop_cpu_copy(GpuBackend* g, Texture& t) {
++  if (!t.gpu || !t.gpu->tex || t.gpu->external || t.gpu->resident) return;
++  if (!t.buf || !t.should_free() || t.locked || t.delay_clear) return;
++  if (t.internal_format != GL_RGBA8 && t.internal_format != GL_R8) return;
++  if (t.gpu->cpu_newer || &t == g->scratch) return;
++  if (t.gpu->width != t.width || t.gpu->height != t.height) return;
++  t.cleanup();
++  mark_resident(*t.gpu, t);
++  t.gpu->gpu_newer = true;
++  g->stats.cpu_freed++;
++}
++
++}  // namespace swgl_gpu
++
++static bool gpu_upload_direct(Texture& t, int x, int y, int w, int h,
++                              const void* data, int row_bytes) {
++  using namespace swgl_gpu;
++  GpuBackend* g = ctx ? ctx->gpu : nullptr;
++  if (!g || g->broken || !t.gpu || !t.gpu->resident || t.buf || w <= 0 ||
++      h <= 0) {
++    return false;
++  }
++  if (t.internal_format != GL_RGBA8 && t.internal_format != GL_R8) return false;
++  if (!ensure_resource(g, t)) return false;
++  GpuTex& gt = *t.gpu;
++  gt.gpu_newer = true;
++  int bpp = t.internal_format == GL_R8 ? 1 : 4;
++  glBindTexture(GL_TEXTURE_2D, gt.tex);
++  glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
++  const uint8_t* src = (const uint8_t*)data;
++  if (gt.expanded || row_bytes != w * bpp) {
++    int obpp = gt.expanded ? 4 : bpp;
++    g->rows.resize(size_t(w) * h * obpp);
++    for (int row = 0; row < h; row++) {
++      if (gt.expanded) {
++        copy_red_to_bgra8(&g->rows[size_t(row) * w * 4],
++                          src + size_t(row) * row_bytes, w);
++      } else {
++        memcpy(&g->rows[size_t(row) * w * bpp], src + size_t(row) * row_bytes,
++               size_t(w) * bpp);
++      }
++    }
++    src = g->rows.data();
++  }
++  GLenum format = gt.expanded || bpp == 4 ? ES_BGRA : ES_RED;
++  glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, w, h, format, GL_UNSIGNED_BYTE, src);
++  g->stats.uploads++;
++  return true;
++}
++
++static void gpu_sync_to_cpu(Texture& t) {
++  if (!t.gpu || !ctx || !ctx->gpu || ctx->gpu_defer_sync) return;
++  if (!t.buf && (t.gpu->external || t.gpu->resident)) {
++    if (!t.allocate()) return;
++    if (t.gpu->resident) {
++      swgl_gpu::unmark_resident(*t.gpu);
++      ctx->gpu->stats.cpu_restored++;
++    }
++  }
++  if (!t.gpu->gpu_newer) return;
++  swgl_gpu::readback(ctx->gpu, t);
++  t.gpu->gpu_newer = false;
++}
++
++static void gpu_cpu_wrote(Texture& t) {
++  if (t.gpu) {
++    t.gpu->cpu_newer = true;
++    t.gpu->gpu_newer = false;
++  }
++}
++
++static void gpu_cpu_wrote_rect(Texture& t, int x0, int y0, int x1, int y1) {
++  if (!t.gpu) return;
++  if (ctx && ctx->gpu && t.gpu->tex && !t.gpu->cpu_newer && !t.gpu->gpu_newer &&
++      t.gpu->width == t.width && t.gpu->height == t.height) {
++    swgl_gpu::upload_rows(ctx->gpu, t, x0, y0, x1, y1);
++  } else {
++    gpu_cpu_wrote(t);
++  }
++}
++
++static void gpu_storage_changed(Texture& t) {
++  if (t.gpu) {
++    t.gpu->gpu_newer = false;
++    t.gpu->cpu_newer = true;
++    swgl_gpu::unmark_resident(*t.gpu);
++  }
++}
++
++static bool gpu_storage_on_gpu(Texture& t) {
++  GpuBackend* g = ctx ? ctx->gpu : nullptr;
++  if (!g || g->broken || !t.should_free() || t.locked) return false;
++  if (t.internal_format != GL_RGBA8 && t.internal_format != GL_R8) return false;
++  if (t.width <= 0 || t.height <= 0 || &t == g->scratch) return false;
++  if (t.width > g->max_texture || t.height > g->max_texture) return false;
++  if (t.buf) t.cleanup();
++  if (!t.gpu) t.gpu = new GpuTex;
++  swgl_gpu::unmark_resident(*t.gpu);
++  swgl_gpu::mark_resident(*t.gpu, t);
++  t.gpu->gpu_newer = false;
++  t.gpu->cpu_newer = false;
++  return true;
++}
++
++static void gpu_release_texture(Texture& t) {
++  delete t.gpu;
++  t.gpu = nullptr;
++}
++
++static void gpu_invalidate(Texture& t) {
++  if (t.gpu) {
++    t.gpu->gpu_newer = false;
++    t.gpu->cpu_newer = false;
++  }
++}
++
++static int gpu_max_texture_size() {
++  GpuBackend* g = ctx ? ctx->gpu : nullptr;
++  return g ? g->max_texture : 0;
++}
++
++static void gpu_count_cpu_draw() {
++  if (ctx->gpu) {
++    ctx->gpu->stats.cpu_draws++;
++    if (swgl_gpu::trace()) {
++      ProgramImpl* impl = ctx->programs[ctx->current_program].impl;
++      fprintf(stderr, "gpu: CPU draw %s\n", impl ? impl->get_name() : "?");
++    }
++  }
++}
++
++Context::~Context() { delete gpu; }
++
++static bool gpu_clear(Texture& t, const IntRect& rect, uint32_t color,
++                      bool is_depth, float depth) {
++  using namespace swgl_gpu;
++  GpuBackend* g = ctx ? ctx->gpu : nullptr;
++  if (!g || g->broken) return false;
++  Texture* ct = nullptr;
++  if (is_depth) {
++    // Depth lives on the GPU whenever there is one (see gpu_d3d11.h). It is
++    // cleared through the colour target it is drawn with.
++    Framebuffer* fb = get_framebuffer(GL_DRAW_FRAMEBUFFER);
++    if (!fb || !fb->depth_attachment ||
++        &ctx->textures[fb->depth_attachment] != &t || !fb->color_attachment) {
++      return false;
++    }
++    ct = &ctx->textures[fb->color_attachment];
++    if (!ct->gpu || !ct->gpu->tex) return false;
++    if (!ensure_resource(g, t, ct->gpu->tex_w, ct->gpu->tex_h) || !t.gpu->rb) {
++      return false;
++    }
++  } else {
++    if (t.gpu && t.gpu->resident && !t.buf && !ensure_resource(g, t)) {
++      return false;
++    }
++    if (!t.gpu || !t.gpu->tex) return false;
++    if (!t.gpu->gpu_newer && t.gpu->cpu_newer) return false;
++    if (!t.gpu->external &&
++        (t.gpu->width != t.width || t.gpu->height != t.height)) {
++      return false;
++    }
++    if (!renderable(t.internal_format)) return false;
++  }
++  GpuTex& gt = *t.gpu;
++  GpuTex& target = ct ? *ct->gpu : gt;
++  if (!bind_target(g, target, ct ? &gt : nullptr)) return false;
++  IntRect r = IntRect(rect).intersection(t.offset_bounds()) - t.offset;
++  float c[4] = {0, 0, 0, 0};
++  if (!is_depth) {
++    if (t.internal_format == GL_R8) {
++      c[0] = (color & 0xFF) / 255.0f;
++      c[3] = 1.0f;
++    } else {
++      c[0] = ((color >> 16) & 0xFF) / 255.0f;
++      c[1] = ((color >> 8) & 0xFF) / 255.0f;
++      c[2] = (color & 0xFF) / 255.0f;
++      c[3] = ((color >> 24) & 0xFF) / 255.0f;
++    }
++  }
++  if (r.x1 > r.x0 && r.y1 > r.y0) {
++    clear_rect(g, target, ct ? &gt : nullptr, r.x0 + target.ox,
++               r.y0 + target.oy, r.x1 + target.ox, r.y1 + target.oy, c, depth);
++  }
++  if (is_depth) gt.pending_depth = -1.0f;
++  t.disable_delayed_clear();
++  gt.gpu_newer = true;
++  gt.cpu_newer = false;
++  g->stats.gpu_clears++;
++  if (trace()) {
++    fprintf(stderr, "gpu: clear %s %dx%d %08x\n", is_depth ? "depth" : "color",
++            t.width, t.height, color);
++  }
++  drop_cpu_copy(g, t);
++  return true;
++}
++
++static bool refuse(GpuBackend* g, bool program, const char* why) {
++  if (program) {
++    g->stats.refused_program++;
++  } else {
++    g->stats.refused_state++;
++  }
++  if (swgl_gpu::trace()) {
++    ProgramImpl* impl = ctx->programs[ctx->current_program].impl;
++    fprintf(stderr, "gpu: CPU for %s: %s\n", impl ? impl->get_name() : "?", why);
++  }
++  return false;
++}
++
++static bool gpu_check(Texture& colortex, Texture** sampled,
++                      GpuProgram** prog_out) {
++  using namespace swgl_gpu;
++  GpuBackend* g = ctx->gpu;
++  if (!g || g->broken) return false;
++  Program& prog = ctx->programs[ctx->current_program];
++  ProgramImpl* impl = prog.gpu_impl;
++  const GpuProgramInfo* info = impl ? impl->gpu_info() : nullptr;
++  if (!info || !gpu_vertex_shader) {
++    return refuse(g, true, "no GPU variant");
++  }
++  static const char* keep_on_cpu = getenv("SWGL_GPU_CPU");
++  if (keep_on_cpu && strstr(info->name, keep_on_cpu)) {
++    return refuse(g, true, "SWGL_GPU_CPU");
++  }
++  if (info->texture_floats > 0 && !g->flat_tex) {
++    return refuse(g, true, "no float texture for flat data");
++  }
++  if (info->num_samplers > MAX_SAMPLERS - 1) {
++    return refuse(g, true, "samplers");
++  }
++  if (!renderable(colortex.internal_format)) {
++    return refuse(g, false, "target format");
++  }
++  if (!blend_supported(g)) {
++    return refuse(g, false, "blend mode");
++  }
++  GpuProgram* p = program_for(g, info);
++  *prog_out = p;
++  if (!p) {
++    return refuse(g, true, "pixel shader refused");
++  }
++  for (int i = 0; i < info->num_samplers; i++) {
++    int unit = impl->gpu_sampler_unit(i);
++    if (unit < 0 || unit >= int(MAX_TEXTURE_UNITS)) {
++      return refuse(g, false, "sampler unit");
++    }
++    GLuint id = info->sampler_rect[i]
++                    ? ctx->texture_units[unit].texture_rectangle_binding
++                    : ctx->texture_units[unit].texture_2d_binding;
++    Texture& st = ctx->textures[id];
++    if (!id || (!st.buf && !st.gpu && st.width <= 0)) {
++      sampled[i] = nullptr;
++      continue;
++    }
++    if ((!st.buf && !(st.gpu && st.gpu->resident)) ||
++        !format_on_gpu(g, st.internal_format) ||
++        st.internal_format == GL_DEPTH_COMPONENT24 ||
++        (st.gpu && st.gpu->external) || st.width > g->max_texture ||
++        st.height > g->max_texture) {
++      return refuse(g, false, "sampled texture");
++    }
++    sampled[i] = &st;
++  }
++  return true;
++}
++
++static bool gpu_can_draw(Texture& colortex) {
++  Texture* sampled[16] = {};
++  GpuProgram* p = nullptr;
++  return gpu_check(colortex, sampled, &p);
++}
++
++static bool gpu_copy(Texture& src, const IntRect& src_rect, Texture& dst,
++                     const IntRect& dst_rect) {
++  using namespace swgl_gpu;
++  GpuBackend* g = ctx ? ctx->gpu : nullptr;
++  if (!g || g->broken || &src == &dst || !src.gpu || !src.gpu->tex) {
++    return false;
++  }
++  GpuTex& sg = *src.gpu;
++  if (sg.cpu_newer || sg.width != src.width || sg.height != src.height) {
++    return false;
++  }
++  if (src.internal_format != dst.internal_format ||
++      !renderable(src.internal_format)) {
++    return false;
++  }
++  int dx = dst_rect.x0 - src_rect.x0;
++  int dy = dst_rect.y0 - src_rect.y0;
++  IntRect s = IntRect(src_rect).intersection(src.bounds());
++  s = s.intersection(dst.bounds() - IntPoint(dx, dy));
++  if (s.is_empty()) return true;
++  if (!to_gpu(g, dst) || dst.gpu->expanded != sg.expanded) return false;
++  if (!bind_target(g, sg, nullptr)) return false;
++  glBindTexture(GL_TEXTURE_2D, dst.gpu->tex);
++  glCopyTexSubImage2D(GL_TEXTURE_2D, 0, s.x0 + dx + dst.gpu->ox,
++                      s.y0 + dy + dst.gpu->oy, s.x0 + sg.ox, s.y0 + sg.oy,
++                      s.width(), s.height());
++  dst.gpu->gpu_newer = true;
++  dst.gpu->cpu_newer = false;
++  if (trace()) fprintf(stderr, "gpu: copy %dx%d\n", s.width(), s.height());
++  drop_cpu_copy(g, dst);
++  return true;
++}
++
++static void gpu_trace_draw(Texture& colortex, int instances) {
++  if (!ctx->gpu || !swgl_gpu::trace()) return;
++  ProgramImpl* impl = ctx->programs[ctx->current_program].impl;
++  fprintf(stderr, "gpu: > %s x%d into %dx%d depth %d blend %d\n",
++          impl ? impl->get_name() : "?", instances, colortex.width,
++          colortex.height, ctx->depthtest, ctx->blend);
++}
++
++static void gpu_record_quad(const vec4& pos, int nump) {
++  GpuBackend* g = ctx ? ctx->gpu : nullptr;
++  if (!g || !g->recording) return;
++  for (int n = 0; n < 4; n++) {
++    int l = nump < 4 && n == 3 ? 2 : n;
++    g->recorded.push_back(pos.x[l]);
++    g->recorded.push_back(pos.y[l]);
++    g->recorded.push_back(pos.z[l]);
++    g->recorded.push_back(pos.w[l]);
++  }
++}
++
++static Texture* gpu_cpu_composite_begin(Texture& colortex) {
++  using namespace swgl_gpu;
++  GpuBackend* g = ctx ? ctx->gpu : nullptr;
++  if (!g || g->broken || !colortex.gpu || !colortex.gpu->tex) return nullptr;
++  if (!colortex.gpu->gpu_newer && !colortex.gpu->external) return nullptr;
++  if (!renderable(colortex.internal_format) || !blend_supported(g)) return nullptr;
++  if (!g->scratch) g->scratch = new Texture;
++  Texture& s = *g->scratch;
++  if (s.width != colortex.width || s.height != colortex.height ||
++      s.internal_format != colortex.internal_format || !s.buf) {
++    set_tex_storage(s, colortex.internal_format, colortex.width,
++                    colortex.height);
++    if (!s.buf) return nullptr;
++    memset(s.buf, 0, s.stride() * s.height);
++  }
++  s.offset = colortex.offset;
++  g->recorded.clear();
++  g->recording = true;
++  return &s;
++}
++
++static void gpu_cpu_composite_end(Texture& colortex, Texture& depthtex) {
++  using namespace swgl_gpu;
++  GpuBackend* g = ctx->gpu;
++  g->recording = false;
++  Texture& s = *g->scratch;
++  size_t quads = g->recorded.size() / 16;
++  if (!quads) return;
++  float vx = float(ctx->viewport.width()) * 0.5f;
++  float vy = float(ctx->viewport.height()) * 0.5f;
++  float ox = float(ctx->viewport.x0 - colortex.offset.x);
++  float oy = float(ctx->viewport.y0 - colortex.offset.y);
++  float bx0 = 1e9f, by0 = 1e9f, bx1 = -1e9f, by1 = -1e9f;
++  std::vector<float>& verts = g->verts;
++  verts.resize(quads * 4 * 8);
++  for (size_t i = 0; i < quads * 4; i++) {
++    const float* p = &g->recorded[i * 4];
++    float w = p[3] != 0.0f ? 1.0f / p[3] : 0.0f;
++    float sx = (p[0] * w + 1) * vx + ox;
++    float sy = (p[1] * w + 1) * vy + oy;
++    bx0 = std::min(bx0, sx);
++    by0 = std::min(by0, sy);
++    bx1 = std::max(bx1, sx);
++    by1 = std::max(by1, sy);
++    float* o = &verts[i * 8];
++    o[0] = p[0];
++    o[1] = p[1];
++    o[2] = p[2];
++    o[3] = p[3];
++    o[4] = sx / float(s.width) * p[3];
++    o[5] = sy / float(s.height) * p[3];
++    o[6] = 0.0f;
++    o[7] = p[3];
++  }
++  IntRect bb = IntRect{int(floorf(bx0)) - 1, int(floorf(by0)) - 1,
++                       int(ceilf(bx1)) + 1, int(ceilf(by1)) + 1}
++                   .intersection(s.bounds());
++  if (bb.is_empty()) return;
++  if (!ensure_resource(g, s)) return;
++  upload_rows(g, s, bb.x0, bb.y0, bb.x1, bb.y1);
++  s.gpu->cpu_newer = false;
++  for (int y = bb.y0; y < bb.y1; y++) {
++    memset(s.sample_ptr(bb.x0, y), 0, size_t(bb.width()) * s.bpp());
++  }
++
++  if (!to_gpu(g, colortex)) return;
++  bool use_depth = ctx->depthtest && depthtex.buf &&
++                   depthtex.width == colortex.width &&
++                   depthtex.height == colortex.height &&
++                   ensure_resource(g, depthtex, colortex.gpu->tex_w,
++                                   colortex.gpu->tex_h) &&
++                   to_gpu(g, depthtex);
++  if (!set_depth(g, colortex, use_depth ? &depthtex : nullptr)) return;
++  set_viewport(*colortex.gpu, colortex);
++  set_blend();
++  glUseProgram(g->copy_prog);
++  glActiveTexture(GL_TEXTURE0);
++  set_filter(s.gpu->tex, GL_NEAREST);
++  s.gpu->filter = GL_NEAREST;
++  for (size_t first = 0; first < quads; first += MAX_QUADS_PER_FLUSH) {
++    size_t n = std::min(quads - first, size_t(MAX_QUADS_PER_FLUSH));
++    draw_quads(g, &verts[first * 4 * 8], int(n), 1);
++  }
++  colortex.gpu->gpu_newer = true;
++  colortex.gpu->cpu_newer = false;
++  if (use_depth && ctx->depthmask) {
++    depthtex.gpu->gpu_newer = true;
++    depthtex.gpu->cpu_newer = false;
++  }
++  if (trace()) {
++    fprintf(stderr, "gpu: CPU-shaded %zu quads placed on the GPU (%dx%d)\n",
++            quads, bb.width(), bb.height());
++  }
++}
++
++template <typename INDEX>
++static bool gpu_draw_elements(GLsizei count, GLsizei instancecount,
++                              size_t offset, VertexArray& v, Texture& colortex,
++                              Texture& depthtex) {
++  using namespace swgl_gpu;
++  GpuBackend* g = ctx->gpu;
++  Program& prog = ctx->programs[ctx->current_program];
++  ProgramImpl* impl = prog.gpu_impl;
++  const GpuProgramInfo* info = impl ? impl->gpu_info() : nullptr;
++  VertexShaderImpl* vs = gpu_vertex_shader;
++  Texture* sampled[16] = {};
++  GpuProgram* gp = nullptr;
++  if (!gpu_check(colortex, sampled, &gp)) return false;
++
++  Buffer& indices_buf = ctx->buffers[v.element_array_buffer_binding];
++  if (!indices_buf.buf || offset >= indices_buf.size) return true;
++
++  if (info->has_accept) {
++    size_t is = std::max(impl->interpolants_size(), sizeof(float));
++    if (g->interps.size() < is * 4) g->interps.resize(is * 4);
++    INDEX* ix = (INDEX*)(indices_buf.buf + offset);
++    GLsizei n = min(count, (GLsizei)((indices_buf.size - offset) / sizeof(INDEX)));
++    for (GLsizei instance = 0; instance < instancecount; instance++) {
++      for (GLsizei i = 0; i + 3 <= n; i += 3) {
++        bool quad = i + 6 <= n && ix[i + 5] == ix[i] + 3;
++        vs->load_attribs(v.attribs, ix[i], instance, quad ? 4 : 3);
++        vs->run_primitive(g->interps.data(), is);
++        if (!impl->gpu_accept(info->loop_limit)) {
++          return refuse(g, false, "a loop longer than the pixel shader's");
++        }
++        if (quad) i += 3;
++      }
++    }
++  }
++
++  if (!to_gpu(g, colortex)) return refuse(g, false, "target on the GPU");
++  bool use_depth = ctx->depthtest && depthtex.buf;
++  if (use_depth) {
++    if (depthtex.width != colortex.width ||
++        depthtex.height != colortex.height ||
++        !ensure_resource(g, depthtex, colortex.gpu->tex_w,
++                         colortex.gpu->tex_h) ||
++        !to_gpu(g, depthtex)) {
++      return refuse(g, false, "depth on the GPU");
++    }
++  }
++  for (int i = 0; i < info->num_samplers; i++) {
++    if (sampled[i] && !to_gpu(g, *sampled[i])) {
++      return refuse(g, false, "sampled on the GPU");
++    }
++  }
++  if (!set_depth(g, colortex, use_depth ? &depthtex : nullptr)) {
++    return refuse(g, false, "no framebuffer");
++  }
++  set_viewport(*colortex.gpu, colortex);
++  set_blend();
++  glUseProgram(gp->prog);
++
++  for (int i = 0; i < info->num_samplers; i++) {
++    glActiveTexture(GL_TEXTURE0 + i);
++    if (!sampled[i]) {
++      glBindTexture(GL_TEXTURE_2D, g->empty_tex);
++      glUniform4f(gp->sampler_size[i], 1, 1, 1, 1);
++      continue;
++    }
++    Texture& st = *sampled[i];
++    GpuTex& sg = *st.gpu;
++    GLuint tex = sg.tex;
++    if (&st == &colortex) {
++      tex = feedback_copy(g, sg);
++    }
++    bool linear = st.mag_filter == GL_LINEAR &&
++                  st.internal_format != GL_RGBA32F &&
++                  st.internal_format != GL_RGBA32I;
++    GLenum filter = linear ? GL_LINEAR : GL_NEAREST;
++    if (tex == sg.tex) {
++      glBindTexture(GL_TEXTURE_2D, tex);
++      if (sg.filter != filter) {
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
++        sg.filter = filter;
++      }
++    } else {
++      set_filter(tex, filter);
++    }
++    glUniform4f(gp->sampler_size[i], float(st.width), float(st.height),
++                1.0f / float(st.width), 1.0f / float(st.height));
++  }
++  if (info->texture_floats > 0) {
++    glActiveTexture(GL_TEXTURE0 + info->num_samplers);
++    glBindTexture(GL_TEXTURE_2D, g->flat_tex);
++    glUniform4f(gp->flat_size, float(FLAT_TEX_WIDTH), float(FLAT_TEX_HEIGHT),
++                1.0f / FLAT_TEX_WIDTH, 1.0f / FLAT_TEX_HEIGHT);
++  }
++
++  // The vertex stage, on the CPU as always.
++  const int slots = info->slots;
++  size_t istride = impl->interpolants_size();
++  if (istride < sizeof(float)) istride = sizeof(float);
++  if (g->interps.size() < istride * 4) g->interps.resize(istride * 4);
++  const int texels = (info->texture_floats + 3) / 4;
++  const int per_row = texels ? FLAT_TEX_WIDTH / texels : 0;
++  const int max_quads =
++      texels ? std::min(MAX_QUADS_PER_FLUSH, per_row * FLAT_TEX_HEIGHT)
++             : MAX_QUADS_PER_FLUSH;
++  g->verts.resize(size_t(max_quads) * 4 * (4 + slots * 4));
++  if (texels) g->flats.resize(size_t(FLAT_TEX_WIDTH) * FLAT_TEX_HEIGHT * 4);
++  float packed[4 * 32];
++  float flat_vals[64];
++  int quads = 0;
++  int flat_rows_used = 0;
++
++  auto flush = [&]() {
++    if (!quads) return;
++    if (texels && flat_rows_used) {
++      glActiveTexture(GL_TEXTURE0 + info->num_samplers);
++      glBindTexture(GL_TEXTURE_2D, g->flat_tex);
++      glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, FLAT_TEX_WIDTH, flat_rows_used,
++                      GL_RGBA, GL_FLOAT, g->flats.data());
++    }
++    draw_quads(g, g->verts.data(), quads, slots);
++    g->stats.gpu_quads += quads;
++    quads = 0;
++    flat_rows_used = 0;
++  };
++
++  auto emit = [&](int nump) {
++    char* ib = g->interps.data();
++    vs->run_primitive(ib, istride);
++    vec4 pos = vs->gl_Position;
++    if (nump < 4) {
++      pos.x[3] = pos.x[2];
++      pos.y[3] = pos.y[2];
++      pos.z[3] = pos.z[2];
++      pos.w[3] = pos.w[2];
++      memcpy(ib + 3 * istride, ib + 2 * istride, istride);
++    }
++    impl->gpu_pack(ib, istride, packed, flat_vals);
++    float* out = &g->verts[size_t(quads) * 4 * (4 + slots * 4)];
++    float fu = 0, fv = 0;
++    if (texels) {
++      int q = quads;
++      int row = q / per_row;
++      int col = (q % per_row) * texels;
++      memcpy(&g->flats[(size_t(row) * FLAT_TEX_WIDTH + col) * 4], flat_vals,
++             size_t(info->texture_floats) * sizeof(float));
++      fu = (col + 0.5f) / FLAT_TEX_WIDTH;
++      fv = (row + 0.5f) / FLAT_TEX_HEIGHT;
++      if (row + 1 > flat_rows_used) flat_rows_used = row + 1;
++    }
++    for (int n = 0; n < 4; n++) {
++      float* o = out + n * (4 + slots * 4);
++      o[0] = pos.x[n];
++      o[1] = pos.y[n];
++      o[2] = pos.z[n];
++      o[3] = pos.w[n];
++      float* p = &packed[n * 32];
++      if (info->flat_coord_offset >= 0) {
++        p[info->flat_coord_offset] = fu;
++        p[info->flat_coord_offset + 1] = fv;
++      }
++      if (info->fragcoord_offset >= 0) {
++        float w = pos.w[n] != 0.0f ? 1.0f / pos.w[n] : 0.0f;
++        p[info->fragcoord_offset] =
++            (pos.x[n] * w + 1) * 0.5f * ctx->viewport.width() +
++            ctx->viewport.x0 - colortex.offset.x;
++        p[info->fragcoord_offset + 1] =
++            (pos.y[n] * w + 1) * 0.5f * ctx->viewport.height() +
++            ctx->viewport.y0 - colortex.offset.y;
++      }
++      memcpy(o + 4, p, size_t(slots) * 16);
++    }
++    if (++quads >= max_quads) flush();
++  };
++
++  assert((offset & (sizeof(INDEX) - 1)) == 0);
++  INDEX* indices = (INDEX*)(indices_buf.buf + offset);
++  count = min(count, (GLsizei)((indices_buf.size - offset) / sizeof(INDEX)));
++  if (count == 6 && indices[1] == indices[0] + 1 &&
++      indices[2] == indices[0] + 2 && indices[5] == indices[0] + 3) {
++    vs->load_attribs(v.attribs, indices[0], 0, 4);
++    emit(4);
++    for (GLsizei instance = 1; instance < instancecount; instance++) {
++      vs->load_attribs(v.attribs, indices[0], instance, 0);
++      emit(4);
++    }
++  } else {
++    for (GLsizei instance = 0; instance < instancecount; instance++) {
++      for (GLsizei i = 0; i + 3 <= count; i += 3) {
++        if (indices[i + 1] != indices[i] + 1 ||
++            indices[i + 2] != indices[i] + 2) {
++          continue;
++        }
++        if (i + 6 <= count && indices[i + 5] == indices[i] + 3) {
++          vs->load_attribs(v.attribs, indices[i], instance, 4);
++          emit(4);
++          i += 3;
++        } else {
++          vs->load_attribs(v.attribs, indices[i], instance, 3);
++          emit(3);
++        }
++      }
++    }
++  }
++  flush();
++
++  colortex.gpu->gpu_newer = true;
++  colortex.gpu->cpu_newer = false;
++  if (use_depth && ctx->depthmask) {
++    depthtex.gpu->gpu_newer = true;
++    depthtex.gpu->cpu_newer = false;
++  }
++  g->stats.gpu_draws++;
++  if (trace()) {
++    fprintf(stderr, "gpu: draw %s x%d into %dx%d fmt %x blend %d depth %d\n",
++            info->name, instancecount, colortex.width, colortex.height,
++            colortex.internal_format, ctx->blend, use_depth);
++  }
++  drop_cpu_copy(g, colortex);
++  for (int i = 0; i < info->num_samplers; i++) {
++    if (sampled[i]) drop_cpu_copy(g, *sampled[i]);
++  }
++  return true;
++}
++
++static bool gpu_resolve_external_pending(Texture& t) {
++  return t.gpu && (t.gpu->external || t.gpu->resident);
++}
++
++static bool gpu_resolve_external(Texture& t) {
++  using namespace swgl_gpu;
++  if (!t.gpu || !(t.gpu->external || t.gpu->resident)) return false;
++  GpuBackend* g = ctx ? ctx->gpu : nullptr;
++  if (g && !g->broken && t.gpu->external) {
++    to_gpu(g, t);
++  }
++  return true;
++}
++
++extern "C" {
++
++// Makes texture `texid` the rectangle at (x, y), `width` by `height`, of the
++// caller's GL texture `gl_texture` (tex_w by tex_h, BGRA, an IOSurface's
++// for a compositor tile). GPU draws go straight into it.
++bool SwglGpuSetTextureTargetGL(GLuint texid, GLuint gl_texture, GLsizei tex_w,
++                               GLsizei tex_h, GLsizei width, GLsizei height,
++                               GLint x, GLint y) {
++  using namespace swgl_gpu;
++  GpuBackend* g = ctx ? ctx->gpu : nullptr;
++  if (!g || g->broken || !gl_texture) return false;
++  Texture& t = ctx->textures[texid];
++  if (t.width != width || t.height != height ||
++      t.internal_format != GL_RGBA8 || !t.should_free()) {
++    t.cleanup();
++    t.set_should_free(true);
++    t.internal_format = GL_RGBA8;
++    t.width = width;
++    t.height = height;
++  }
++  t.offset = IntPoint(0, 0);
++  t.disable_delayed_clear();
++  if (!t.gpu) t.gpu = new GpuTex;
++  GpuTex& gt = *t.gpu;
++  if (gt.tex != gl_texture || !gt.external) {
++    gt.release();
++    gt.tex = gl_texture;
++    gt.external = true;
++    gt.tex_w = tex_w;
++    gt.tex_h = tex_h;
++    gt.filter = 0;
++  }
++  gt.internal_format = GL_RGBA8;
++  gt.width = width;
++  gt.height = height;
++  gt.ox = x;
++  gt.oy = y;
++  gt.expanded = false;
++  gt.gpu_newer = true;
++  gt.cpu_newer = false;
++  return true;
++}
++
++// What a native compositor hands WebRender for a tile the GPU draws into,
++// with a negative stride (sw_compositor.rs): the GL texture over the tile's
++// IOSurface, and that surface's size.
++struct SwglGpuGLTile {
++  uint32_t texture;
++  int32_t width;
++  int32_t height;
++};
++
++bool SwglGpuSetTextureTarget(GLuint texid, void* tile, GLsizei width,
++                             GLsizei height, GLint x, GLint y) {
++  const SwglGpuGLTile* t = (const SwglGpuGLTile*)tile;
++  return t && SwglGpuSetTextureTargetGL(texid, t->texture, t->width, t->height,
++                                        width, height, x, y);
++}
++
++void SwglGpuDescribe(char* out, size_t size) {
++  GpuBackend* g = ctx ? ctx->gpu : nullptr;
++  if (!g) {
++    snprintf(out, size, "no device");
++    return;
++  }
++  snprintf(out, size,
++           "OpenGL ES 2 %s, red targets %s, float textures %s, min/max blend "
++           "%s, depth %d bits, max texture %d",
++           (const char*)glGetString(GL_RENDERER), g->red_ok ? "yes" : "no",
++           g->float_ok ? "yes" : "NO", g->minmax_ok ? "yes" : "no",
++           g->depth24_ok ? 24 : 16, g->max_texture);
++}
++
++// Attaches the GL context current on this thread to the current SWGL
++// context; from then on draws that can run on it do. NULL detaches.
++bool SwglGpuAttach(void* current) {
++  if (!ctx) return false;
++  delete ctx->gpu;
++  ctx->gpu = nullptr;
++  if (!current) return true;
++  GpuBackend* g = new GpuBackend;
++  if (!swgl_gpu::init_backend(g)) {
++    delete g;
++    return false;
++  }
++  ctx->gpu = g;
++  return true;
++}
++
++bool SwglGpuAttachNewDevice(int, bool) { return false; }
++void* SwglGpuTestCreateTile(int, int) { return nullptr; }
++void SwglGpuTestReleaseTile(void*) {}
++bool SwglGpuTestReadTile(void*, int, int, int, int, void*, int) {
++  return false;
++}
++
++// Ends the GPU's part of a frame: what it drew into IOSurfaces is done
++// before Core Animation shows them.
++void SwglGpuFinish() {
++  if (ctx && ctx->gpu) glFinish();
++}
++
++void SwglGpuStats(uint32_t* out8) {
++  GpuBackend* g = ctx ? ctx->gpu : nullptr;
++  if (!g) {
++    memset(out8, 0, 8 * sizeof(uint32_t));
++    return;
++  }
++  out8[0] = g->stats.gpu_draws;
++  out8[1] = g->stats.cpu_draws;
++  out8[2] = g->stats.gpu_quads;
++  out8[3] = g->stats.uploads;
++  out8[4] = g->stats.readbacks;
++  out8[5] = g->stats.gpu_clears;
++  out8[6] = g->stats.refused_program;
++  out8[7] = g->stats.refused_state;
++  g->stats = GpuBackend::Stats();
++}
++
++void SwglGpuMemoryStats(uint32_t* out5) {
++  GpuBackend* g = ctx ? ctx->gpu : nullptr;
++  if (!g) {
++    memset(out5, 0, 5 * sizeof(uint32_t));
++    return;
++  }
++  out5[0] = g->stats.cpu_freed;
++  out5[1] = g->stats.cpu_restored;
++  out5[2] = uint32_t(std::max<int64_t>(swgl_gpu::resident_bytes, 0) >> 20);
++  out5[3] = uint32_t(std::max<int64_t>(swgl_gpu::gpu_tex_bytes, 0) >> 20);
++  out5[4] = uint32_t(std::max<int64_t>(swgl_gpu::gpu_cache_bytes, 0) >> 20);
++}
++
++}  // extern "C"
++
++#endif
+-- 
+2.53.0
+

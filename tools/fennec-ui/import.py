@@ -163,8 +163,18 @@ def main():
     for size, suffix in ((72, ""), (144, "@2x")):
         w = size * icon.width // icon.height
         icon.resize((w, size), Image.LANCZOS).save(os.path.join(OUT, "fx_brand_logo%s.png" % suffix))
+    make_launch_images(os.path.join(fxhome, "Sources", "Images", "Background@2x.png"))
     make_app_icons(icon, os.path.join(fxhome, "Sources", "Images", "Background@2x.png"))
     print(len(os.listdir(OUT)), "files in", OUT)
+
+
+def make_launch_images(background_path):
+    """Firefox Home's blue while LegacyFox starts; Default-568h@2x.png is
+    also what tells iOS 6 the app fills the iPhone 5's taller screen."""
+    bg = Image.open(background_path).convert("RGB")
+    for name, size in (("Default.png", (320, 480)), ("Default@2x.png", (640, 960)),
+                       ("Default-568h@2x.png", (640, 1136))):
+        bg.resize(size, Image.LANCZOS).save(os.path.join(ROOT, "shell", "Resources", name))
 
 
 def make_app_icons(icon, texture_path):

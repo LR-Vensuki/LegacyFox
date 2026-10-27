@@ -93,6 +93,12 @@ enum {
 // GeckoView's { found, current, total }.
 - (void)find:(NSString*)text backwards:(BOOL)backwards reply:(LFReply)reply;
 - (void)clearMatches;
+// Scrolls smoothly by screens (GeckoView:ScrollBy), negative is up.
+- (void)scrollByScreens:(float)screens;
+// The User-Agent pages see (nil: Gecko's own), for sessions opened from
+// now on; -applyUserAgent passes it to an open one.
++ (void)setUserAgent:(NSString*)agent;
+- (void)applyUserAgent;
 // The desktop site: a Mac user agent and a desktop viewport; reloads.
 @property(nonatomic) BOOL desktopMode;
 - (void)close;

@@ -1,0 +1,244 @@
+From 3d61351269ba17eb2492cdb4c6adb29e110bd950 Mon Sep 17 00:00:00 2001
+From: LR-Vensuki <260785366+LR-Vensuki@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 00:07:16 +0300
+Subject: [PATCH] SWGL GPU path: tiles let go of their IOSurfaces each frame;
+ memory and fallbacks in the log
+
+A GL texture over an IOSurface, and a framebuffer holding that texture,
+keep the surface in use, and a surface in use never returns to the swap
+chain: every frame took new tiles until the address space ran out. The
+tile textures and SWGL's framebuffers for them now go once the GPU has
+finished the frame. LF_SWGL_GPU_STATS=1 adds the process's resident and
+mapped memory; each program and reason a draw stays on the CPU is logged
+once.
+---
+ .../RenderCompositorNative.cpp                | 26 ++++++----
+ .../RenderCompositorSWGLGPU.h                 |  3 ++
+ .../RenderCompositorSWGLGPU.mm                | 47 +++++--------------
+ gfx/wr/swgl/src/gpu_gles2.h                   | 38 +++++++++++++--
+ 4 files changed, 67 insertions(+), 47 deletions(-)
+
+diff --git a/gfx/webrender_bindings/RenderCompositorNative.cpp b/gfx/webrender_bindings/RenderCompositorNative.cpp
+index 8d7ae923b1..a509f1a76f 100644
+--- a/gfx/webrender_bindings/RenderCompositorNative.cpp
++++ b/gfx/webrender_bindings/RenderCompositorNative.cpp
+@@ -23,6 +23,7 @@
+ #if defined(MOZ_IOS_LEGACY)
+ #  include "mozilla/layers/NativeLayerCA.h"
+ #  include "RenderCompositorSWGLGPU.h"
++#  include <mach/mach.h>
+ #endif
+ 
+ namespace mozilla::wr {
+@@ -689,19 +690,28 @@ bool RenderCompositorNativeSWGL::MakeCurrent() {
+ 
+ #if defined(MOZ_IOS_LEGACY)
+ void RenderCompositorNativeSWGL::DoFlush() {
+-  if (!mGpuAttached) {
+-    return;
++  if (mGpuAttached) {
++    SwglGpuFinish();
++    SwglGpuEAGLEndFrame(mGpu);
+   }
+-  SwglGpuFinish();
+-  // LF_SWGL_GPU_STATS=1: the GPU path's counters every 60 frames.
++  // LF_SWGL_GPU_STATS=1: the GPU path's counters and the process's memory
++  // every 10 frames.
+   static const bool stats = getenv("LF_SWGL_GPU_STATS");
+-  if (stats && ++mGpuFrames % 60 == 0) {
+-    uint32_t s[8];
++  if (stats && ++mGpuFrames % (mGpuAttached ? 1 : 10) == 0) {
++    uint32_t s[8], m[5];
++    task_basic_info_data_t info = {};
++    mach_msg_type_number_t count = TASK_BASIC_INFO_COUNT;
++    task_info(mach_task_self(), TASK_BASIC_INFO, (task_info_t)&info, &count);
++    SwglGpuMemoryStats(m);
+     SwglGpuStats(s);
+     printf_stderr(
+         "LegacyFox: SWGL GPU draws %u, CPU draws %u, quads %u, uploads %u, "
+-        "readbacks %u, clears %u, refused program %u, state %u\n",
+-        s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]);
++        "readbacks %u, clears %u, refused program %u, state %u; CPU copies "
++        "freed %u, back %u, saved %u MB, GPU textures %u MB, caches %u MB; "
++        "process %u MB resident, %u MB mapped\n",
++        s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], m[0], m[1], m[2], m[3],
++        m[4], unsigned(info.resident_size >> 20),
++        unsigned(info.virtual_size >> 20));
+   }
+ }
+ #endif
+diff --git a/gfx/webrender_bindings/RenderCompositorSWGLGPU.h b/gfx/webrender_bindings/RenderCompositorSWGLGPU.h
+index c0ca1f0d7f..a8390ec464 100644
+--- a/gfx/webrender_bindings/RenderCompositorSWGLGPU.h
++++ b/gfx/webrender_bindings/RenderCompositorSWGLGPU.h
+@@ -21,6 +21,8 @@ bool SwglGpuEAGLMakeCurrent(SwglGpuEAGL* aGpu);
+ void SwglGpuEAGLDestroy(SwglGpuEAGL* aGpu);
+ // A texture of the current context that is aSurface; 0 on failure.
+ uint32_t SwglGpuEAGLTexture(SwglGpuEAGL* aGpu, IOSurfaceRef aSurface);
++// Drops this frame's tile textures; the GPU must be done with them.
++void SwglGpuEAGLEndFrame(SwglGpuEAGL* aGpu);
+ 
+ }  // namespace mozilla::wr
+ 
+@@ -35,6 +37,7 @@ bool SwglGpuAttach(void* current);
+ void SwglGpuDescribe(char* out, size_t size);
+ void SwglGpuFinish();
+ void SwglGpuStats(uint32_t* out8);
++void SwglGpuMemoryStats(uint32_t* out5);
+ }
+ 
+ #endif
+diff --git a/gfx/webrender_bindings/RenderCompositorSWGLGPU.mm b/gfx/webrender_bindings/RenderCompositorSWGLGPU.mm
+index 564549da98..12cacfb150 100644
+--- a/gfx/webrender_bindings/RenderCompositorSWGLGPU.mm
++++ b/gfx/webrender_bindings/RenderCompositorSWGLGPU.mm
+@@ -28,20 +28,12 @@ namespace mozilla::wr {
+ 
+ struct SwglGpuEAGL {
+   EAGLContext* mContext = nil;
+-  struct Entry {
+-    IOSurfaceRef mSurface;
+-    uint32_t mId;
+-    GLuint mTexture;
+-    uint64_t mLastUse;
+-  };
+-  std::vector<Entry> mTextures;
+-  uint64_t mUse = 0;
++  // This frame's tile textures. A texture over an IOSurface keeps it in use
++  // (IOSurfaceIsInUse), and a surface in use never comes back to the swap
++  // chain, so they go once the frame is done.
++  std::vector<GLuint> mTextures;
+ };
+ 
+-// Tiles come in a few sizes and a three-deep swap chain each; textures for
+-// surfaces gone from the pool are dropped as new ones come.
+-static const size_t kMaxTextures = 48;
+-
+ SwglGpuEAGL* SwglGpuEAGLCreate() {
+   EAGLContext* context =
+       [[EAGLContext alloc] initWithAPI:kEAGLRenderingAPIOpenGLES2];
+@@ -65,33 +57,20 @@ void SwglGpuEAGLDestroy(SwglGpuEAGL* aGpu) {
+     return;
+   }
+   [EAGLContext setCurrentContext:aGpu->mContext];
+-  for (auto& e : aGpu->mTextures) {
+-    glDeleteTextures(1, &e.mTexture);
+-  }
++  SwglGpuEAGLEndFrame(aGpu);
+   [EAGLContext setCurrentContext:nil];
+   [aGpu->mContext release];
+   delete aGpu;
+ }
+ 
+-uint32_t SwglGpuEAGLTexture(SwglGpuEAGL* aGpu, IOSurfaceRef aSurface) {
+-  uint32_t id = IOSurfaceGetID(aSurface);
+-  aGpu->mUse++;
+-  for (auto& e : aGpu->mTextures) {
+-    if (e.mSurface == aSurface && e.mId == id) {
+-      e.mLastUse = aGpu->mUse;
+-      return e.mTexture;
+-    }
+-  }
+-  if (aGpu->mTextures.size() >= kMaxTextures) {
+-    auto oldest = aGpu->mTextures.begin();
+-    for (auto it = aGpu->mTextures.begin(); it != aGpu->mTextures.end(); ++it) {
+-      if (it->mLastUse < oldest->mLastUse) {
+-        oldest = it;
+-      }
+-    }
+-    glDeleteTextures(1, &oldest->mTexture);
+-    aGpu->mTextures.erase(oldest);
++void SwglGpuEAGLEndFrame(SwglGpuEAGL* aGpu) {
++  if (!aGpu->mTextures.empty()) {
++    glDeleteTextures(GLsizei(aGpu->mTextures.size()), aGpu->mTextures.data());
++    aGpu->mTextures.clear();
+   }
++}
++
++uint32_t SwglGpuEAGLTexture(SwglGpuEAGL* aGpu, IOSurfaceRef aSurface) {
+   GLuint tex = 0;
+   glGenTextures(1, &tex);
+   glBindTexture(GL_TEXTURE_2D, tex);
+@@ -112,7 +91,7 @@ uint32_t SwglGpuEAGLTexture(SwglGpuEAGL* aGpu, IOSurfaceRef aSurface) {
+     glDeleteTextures(1, &tex);
+     return 0;
+   }
+-  aGpu->mTextures.push_back({aSurface, id, tex, aGpu->mUse});
++  aGpu->mTextures.push_back(tex);
+   return tex;
+ }
+ 
+diff --git a/gfx/wr/swgl/src/gpu_gles2.h b/gfx/wr/swgl/src/gpu_gles2.h
+index f1d887d664..933a531772 100644
+--- a/gfx/wr/swgl/src/gpu_gles2.h
++++ b/gfx/wr/swgl/src/gpu_gles2.h
+@@ -223,6 +223,8 @@ struct GpuBackend {
+   // A framebuffer for reading textures that are not render targets.
+   GLuint read_fbo = 0;
+ 
++  // SWGL textures made compositor tiles this frame (SwglGpuFinish).
++  std::vector<GLuint> tile_targets;
+   std::unordered_map<const GpuProgramInfo*, GpuProgram> programs;
+   std::unordered_map<const GpuProgramInfo*, bool> refused;
+ 
+@@ -1079,9 +1081,20 @@ static bool refuse(GpuBackend* g, bool program, const char* why) {
+   } else {
+     g->stats.refused_state++;
+   }
+-  if (swgl_gpu::trace()) {
+-    ProgramImpl* impl = ctx->programs[ctx->current_program].impl;
+-    fprintf(stderr, "gpu: CPU for %s: %s\n", impl ? impl->get_name() : "?", why);
++  // Each program and reason once, without SWGL_GPU_TRACE too: a draw left
++  // on the CPU is the slow path, and may read back what the GPU holds.
++  ProgramImpl* impl = ctx->programs[ctx->current_program].impl;
++  const char* name = impl ? impl->get_name() : "?";
++  static std::vector<std::pair<std::string, const char*>> seen;
++  bool first = true;
++  for (auto& e : seen) {
++    if (e.second == why && e.first == name) first = false;
++  }
++  if (first && seen.size() < 64) {
++    seen.emplace_back(name, why);
++  }
++  if (first || swgl_gpu::trace()) {
++    fprintf(stderr, "gpu: CPU for %s: %s\n", name, why);
+   }
+   return false;
+ }
+@@ -1568,6 +1581,7 @@ bool SwglGpuSetTextureTargetGL(GLuint texid, GLuint gl_texture, GLsizei tex_w,
+     gt.tex_h = tex_h;
+     gt.filter = 0;
+   }
++  g->tile_targets.push_back(texid);
+   gt.internal_format = GL_RGBA8;
+   gt.width = width;
+   gt.height = height;
+@@ -1633,9 +1647,23 @@ bool SwglGpuTestReadTile(void*, int, int, int, int, void*, int) {
+ }
+ 
+ // Ends the GPU's part of a frame: what it drew into IOSurfaces is done
+-// before Core Animation shows them.
++// before Core Animation shows them, and SWGL lets go of the tiles' textures
++// (a framebuffer holding one would keep its IOSurface in use), which the
++// compositor deletes next.
+ void SwglGpuFinish() {
+-  if (ctx && ctx->gpu) glFinish();
++  GpuBackend* g = ctx ? ctx->gpu : nullptr;
++  if (!g) return;
++  glFinish();
++  for (GLuint id : g->tile_targets) {
++    Texture* t = ctx->textures.find(id);
++    if (t && t->gpu && t->gpu->external) {
++      t->gpu->release();
++      // Nothing of the tile is left on either side until it is bound again.
++      t->gpu->cpu_newer = false;
++      t->gpu->gpu_newer = false;
++    }
++  }
++  g->tile_targets.clear();
+ }
+ 
+ void SwglGpuStats(uint32_t* out8) {
+-- 
+2.53.0
+

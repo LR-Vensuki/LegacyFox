@@ -26,5 +26,8 @@
     NSMutableArray *_tabs;
     NSMutableArray *_recent;
     LFTab *_current;
+    // The tab whose page was closed for memory (memoryCritical), shown as a
+    // note until it is opened again; not retained.
+    LFTab *_closedForMemory;
 }
 @end

@@ -1,0 +1,107 @@
+From 4aa70423b4a07759326152aad17ace6df222b531 Mon Sep 17 00:00:00 2001
+From: LR-Vensuki <260785366+LR-Vensuki@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 18:27:02 +0300
+Subject: [PATCH] LegacyFoxMemory: minimize memory, memory reports and GC/CC
+ logs for the shell
+
+LegacyFox:Memory:Minimize answers once GC, CC and caches gave back what
+they could; Report and CCLogs write about:memory's reports and the
+collectors' graphs to files for tools/profile.
+---
+ .../geckoview/GeckoViewStartup.sys.mjs        |  8 +++
+ .../modules/geckoview/LegacyFoxMemory.sys.mjs | 51 +++++++++++++++++++
+ mobile/shared/modules/geckoview/moz.build     |  1 +
+ 3 files changed, 60 insertions(+)
+ create mode 100644 mobile/shared/modules/geckoview/LegacyFoxMemory.sys.mjs
+
+diff --git a/mobile/shared/components/geckoview/GeckoViewStartup.sys.mjs b/mobile/shared/components/geckoview/GeckoViewStartup.sys.mjs
+index 83a390311f..6ed7ddfe9a 100644
+--- a/mobile/shared/components/geckoview/GeckoViewStartup.sys.mjs
++++ b/mobile/shared/components/geckoview/GeckoViewStartup.sys.mjs
+@@ -153,6 +153,14 @@ export class GeckoViewStartup {
+               "LegacyFox:Places:FetchIcon",
+             ],
+           });
++          GeckoViewUtils.addLazyGetter(this, "LegacyFoxMemory", {
++            module: "resource://gre/modules/LegacyFoxMemory.sys.mjs",
++            ged: [
++              "LegacyFox:Memory:Minimize",
++              "LegacyFox:Memory:Report",
++              "LegacyFox:Memory:CCLogs",
++            ],
++          });
+           GeckoViewUtils.addLazyGetter(this, "LegacyFoxSync", {
+             module: "resource://gre/modules/LegacyFoxSync.sys.mjs",
+             ged: [
+diff --git a/mobile/shared/modules/geckoview/LegacyFoxMemory.sys.mjs b/mobile/shared/modules/geckoview/LegacyFoxMemory.sys.mjs
+new file mode 100644
+index 0000000000..9eb77a5344
+--- /dev/null
++++ b/mobile/shared/modules/geckoview/LegacyFoxMemory.sys.mjs
+@@ -0,0 +1,51 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++// LegacyFox: memory for the iOS 4-7 shell. Minimize gives back all it can
++// (GC, CC, caches), and answers once done: the shell reopens a page it had
++// to close for memory after that. Report writes about:memory's reports to a
++// file, and CCLogs the cycle collector's and GC's graphs (MOZ_CC_LOG_DIRECTORY),
++// for tools/profile.
++
++import { GeckoViewUtils } from "resource://gre/modules/GeckoViewUtils.sys.mjs";
++
++const { warn } = GeckoViewUtils.initLogging("LegacyFoxMemory");
++
++export const LegacyFoxMemory = {
++  onEvent(aEvent, aData, aCallback) {
++    try {
++      switch (aEvent) {
++        case "LegacyFox:Memory:Minimize":
++          Cc["@mozilla.org/memory-reporter-manager;1"]
++            .getService(Ci.nsIMemoryReporterManager)
++            .minimizeMemoryUsage(() => aCallback.onSuccess(true));
++          break;
++        case "LegacyFox:Memory:Report":
++          Cc["@mozilla.org/memory-info-dumper;1"]
++            .getService(Ci.nsIMemoryInfoDumper)
++            .dumpMemoryReportsToNamedFile(
++              aData.path,
++              () => aCallback.onSuccess(aData.path),
++              null,
++              /* anonymize */ false,
++              /* minimizeMemoryUsage */ false
++            );
++          break;
++        case "LegacyFox:Memory:CCLogs":
++          Cc["@mozilla.org/memory-info-dumper;1"]
++            .getService(Ci.nsIMemoryInfoDumper)
++            .dumpGCAndCCLogsToFile(aData.name, true, false, {
++              onDump(aGCLog, aCCLog) {
++                aCallback.onSuccess([aGCLog.path, aCCLog.path]);
++              },
++              onFinish() {},
++            });
++          break;
++      }
++    } catch (e) {
++      warn`${aEvent}: ${e}`;
++      aCallback.onError(String(e));
++    }
++  },
++};
+diff --git a/mobile/shared/modules/geckoview/moz.build b/mobile/shared/modules/geckoview/moz.build
+index 1796893668..dcbc6f265a 100644
+--- a/mobile/shared/modules/geckoview/moz.build
++++ b/mobile/shared/modules/geckoview/moz.build
+@@ -39,6 +39,7 @@ EXTRA_JS_MODULES += [
+     "GeckoViewWebExtension.sys.mjs",
+     "LegacyFoxDownloads.sys.mjs",
+     "LegacyFoxLogins.sys.mjs",
++    "LegacyFoxMemory.sys.mjs",
+     "LegacyFoxPlaces.sys.mjs",
+     "LegacyFoxSync.sys.mjs",
+     "LoadURIDelegate.sys.mjs",
+-- 
+2.53.0
+

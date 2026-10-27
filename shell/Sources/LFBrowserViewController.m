@@ -27,6 +27,11 @@
     [_placeholder setTextAlignment:UITextAlignmentCenter];
     [_placeholder setTextColor:[UIColor grayColor]];
     [_placeholder setAutoresizingMask:UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight];
+    [_placeholder setUserInteractionEnabled:YES];
+    UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self
+                                                                          action:@selector(reopenClosedForMemory)];
+    [_placeholder addGestureRecognizer:tap];
+    [tap release];
     [_pageView addSubview:_placeholder];
     [root addSubview:_pageView];
 
@@ -56,6 +61,10 @@
     _tabs = [[NSMutableArray alloc] init];
     _recent = [[NSMutableArray alloc] init];
     [[LFStore shared] start];
+    [LFGeckoSession setUserAgent:[LFSettings userAgentString]];
+    [LFSettings applyDownloadFolder];
+    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(userAgentChanged)
+                                                 name:LFUserAgentChanged object:nil];
     // Sync and the account WebChannel start before any page loads: an
     // account page restored from the last run must find the channel open.
     [self startSync];
@@ -78,19 +87,40 @@
     NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
     [nc addObserver:self selector:@selector(saveSession) name:UIApplicationDidEnterBackgroundNotification object:nil];
     [nc addObserver:self selector:@selector(saveSession) name:UIApplicationWillTerminateNotification object:nil];
+    // A page out of sight stops painting and its timers slow down, as
+    // GeckoView apps do when they pause; it paints again on the way back.
+    [nc addObserver:self selector:@selector(appDidEnterBackground) name:UIApplicationDidEnterBackgroundNotification object:nil];
+    [nc addObserver:self selector:@selector(appWillEnterForeground) name:UIApplicationWillEnterForegroundNotification object:nil];
+    // Gecko's watcher: memory or address space is getting short, and iOS is
+    // about to kill the app for memory.
+    [nc addObserver:self selector:@selector(memoryLow) name:@"LegacyFoxMemoryLow" object:nil];
+    [nc addObserver:self selector:@selector(memoryCritical) name:@"LegacyFoxMemoryCritical" object:nil];
 
     // Developer aid (LF_UI_STEPS in the debug file): UI actions run one
     // every 4 s after a 12 s start, for screenshots without touching the
     // device. Steps: newtab, tabs, menu, edit, back, forward, select:N,
     // memwarn, settings, passwords, testlogin, promptok, landscape, portrait,
     // wait, go:URL, snap:NAME (Library/LegacyFox/snap-NAME.png), cancel,
-    // section:N (of the Awesome Screen).
+    // section:N (of the Awesome Screen), scroll, scrollup, scrolls:N,
+    // memreport:NAME, memcritical, minimize, cclogs:NAME.
     const char *steps = getenv("LF_UI_STEPS");
     if (steps) {
-        NSArray *list = [[NSString stringWithUTF8String:steps] componentsSeparatedByString:@","];
+        // Nobody touches the device during a run: without this the screen
+        // locks after a minute and the run ends in the background.
+        [[UIApplication sharedApplication] setIdleTimerDisabled:YES];
+        // Steps are separated by commas, or by | when a step holds commas.
+        NSString *all = [NSString stringWithUTF8String:steps];
+        NSArray *list = [all componentsSeparatedByString:[all rangeOfString:@"|"].location != NSNotFound ? @"|" : @","];
         for (NSUInteger i = 0; i < [list count]; i++)
             [self performSelector:@selector(runStep:) withObject:[list objectAtIndex:i] afterDelay:12 + 4 * i];
     }
+}
+
+- (void)userAgentChanged {
+    [LFGeckoSession setUserAgent:[LFSettings userAgentString]];
+    for (LFTab *tab in _tabs)
+        [[tab session] applyUserAgent];
+    [[_current session] reload];
 }
 
 - (void)startSync {
@@ -155,6 +185,15 @@
     }
     else if ([step isEqualToString:@"newtab"]) [self newTab];
     else if ([step isEqualToString:@"cancel"]) [self hideAwesome];
+    else if ([step isEqualToString:@"scroll"]) [[_current session] scrollByScreens:1];
+    else if ([step isEqualToString:@"scrollup"]) [[_current session] scrollByScreens:-1];
+    else if ([step hasPrefix:@"scrolls:"]) {
+        // Scrolling without a pause, down and up, for a while (for profiles).
+        int n = [[step substringFromIndex:8] intValue];
+        for (int i = 0; i < n; i++)
+            [self performSelector:@selector(runStep:) withObject:(i / 6) % 2 ? @"scrollup" : @"scroll"
+                       afterDelay:0.5 * i];
+    }
     else if ([step isEqualToString:@"doorhanger"]) {
         // A password doorhanger for a made-up login, answered nowhere.
         NSDictionary *login = [NSDictionary dictionaryWithObjectsAndKeys:@"https://example.com", @"origin",
@@ -174,6 +213,24 @@
     else if ([step isEqualToString:@"forward"]) [self goForward];
     else if ([step hasPrefix:@"select:"]) [self selectTab:[_tabs objectAtIndex:[[step substringFromIndex:7] intValue]]];
     else if ([step isEqualToString:@"memwarn"]) [self didReceiveMemoryWarning];
+    else if ([step isEqualToString:@"memcritical"]) [self memoryCritical];
+    else if ([step hasPrefix:@"cclogs:"])
+        // The GC and CC graphs, into MOZ_CC_LOG_DIRECTORY (debug file).
+        [[LFGeckoRuntime shared] dispatch:@"LegacyFox:Memory:CCLogs"
+                                  message:[NSDictionary dictionaryWithObject:[step substringFromIndex:7] forKey:@"name"]
+                                    reply:^(id r, id e) { NSLog(@"LegacyFox: GC/CC logs %@ %@", r, e); }];
+    else if ([step isEqualToString:@"minimize"])
+        [[LFGeckoRuntime shared] dispatch:@"LegacyFox:Memory:Minimize" message:nil reply:^(id r, id e) {
+            NSLog(@"LegacyFox: memory minimized");
+        }];
+    else if ([step hasPrefix:@"memreport:"])
+        // about:memory's reports, Library/LegacyFox/memory-NAME.json.gz.
+        [[LFGeckoRuntime shared] dispatch:@"LegacyFox:Memory:Report"
+                                  message:[NSDictionary dictionaryWithObject:
+                                               [NSString stringWithFormat:@"/var/mobile/Library/LegacyFox/memory-%@.json.gz",
+                                                                          [step substringFromIndex:10]]
+                                                                      forKey:@"path"]
+                                    reply:nil];
     else if ([step isEqualToString:@"settings"]) [self showSettings];
     else if ([step isEqualToString:@"desktop"]) [[_current session] setDesktopMode:YES];
     else if ([step isEqualToString:@"private"]) [self newPrivateTab];
@@ -237,6 +294,14 @@ static id LFPlistSafe(id value) {
 }
 
 // Tabs come back after a restart, as in Firefox; private ones never do.
+- (void)appDidEnterBackground {
+    [[_current session] setActive:NO];
+}
+
+- (void)appWillEnterForeground {
+    [[_current session] setActive:YES];
+}
+
 - (void)saveSession {
     if (getenv("LF_DEMO"))
         return;
@@ -449,9 +514,11 @@ static void LFDrawSurfacePiece(CGContextRef c, LFSurfacePiece *piece, CGColorSpa
     [self selectTab:tab];
 }
 
-// Pages kept alive in the background besides the current one. A 512 MB
-// device has room for one; the rest are reloaded when chosen.
-static const NSUInteger kLiveBackgroundTabs = 1;
+// Pages kept alive in the background besides the current one: none. Two
+// heavy pages do not fit in the 768 MB of address space a 32-bit app has;
+// a tab chosen again opens from its saved state (history, scroll position)
+// and the HTTP cache.
+static const NSUInteger kLiveBackgroundTabs = 0;
 
 - (void)unloadBackgroundTabsKeeping:(NSUInteger)keep {
     // _recent: most recently used first.
@@ -471,6 +538,38 @@ static const NSUInteger kLiveBackgroundTabs = 1;
     [self unloadBackgroundTabsKeeping:0];
 }
 
+// Background pages go first, before the one in front runs out.
+- (void)memoryLow {
+    [self unloadBackgroundTabsKeeping:0];
+}
+
+// Out of memory with every other tab gone already: the page in front is
+// closed (as Safari drops a page that grew too big) instead of iOS killing
+// the whole browser, and opens again from its saved state on a tap. Endless
+// feeds get there after minutes of scrolling. Opening it again at once
+// crashed: some sites leave their closed page in memory for a while.
+- (void)memoryCritical {
+    [self unloadBackgroundTabsKeeping:0];
+    LFTab *tab = _current;
+    if (![tab isLoaded])
+        return;
+    NSLog(@"LegacyFox: out of memory, %@ is closed", [tab url]);
+    [tab unload];
+    _closedForMemory = tab;
+    [[LFGeckoRuntime shared] dispatch:@"LegacyFox:Memory:Minimize" message:nil];
+    [self showCurrentPage];
+    [self showTabState:NO];
+}
+
+- (void)reopenClosedForMemory {
+    if (!_closedForMemory || _closedForMemory != _current)
+        return;
+    _closedForMemory = nil;
+    [_current loadWithDelegate:self];
+    [self showCurrentPage];
+    [self showTabState:NO];
+}
+
 - (void)selectTab:(LFTab *)tab {
     if (tab == _current)
         return;
@@ -483,6 +582,8 @@ static const NSUInteger kLiveBackgroundTabs = 1;
     [_recent removeObject:tab];
     [_recent insertObject:tab atIndex:0];
     [self unloadBackgroundTabsKeeping:kLiveBackgroundTabs];
+    if (tab == _closedForMemory)
+        _closedForMemory = nil;
     [tab loadWithDelegate:self];
     [self showCurrentPage];
     [self showTabState:NO];
@@ -502,6 +603,9 @@ static const NSUInteger kLiveBackgroundTabs = 1;
         }
         [[_current session] setActive:YES];
         [_placeholder setHidden:YES];
+    } else if (_current && _current == _closedForMemory) {
+        [_placeholder setText:@"Страница закрыта: ей не хватило памяти устройства.\n\nНажмите, чтобы открыть её снова."];
+        [_placeholder setHidden:NO];
     } else if ([_current isLoaded]) {
         [_placeholder setText:@"LegacyFox\n\nДвижок Gecko не подключён: это оболочка без движка."];
         [_placeholder setHidden:NO];
@@ -698,7 +802,12 @@ static const NSUInteger kLiveBackgroundTabs = 1;
 
 - (void)topBarBack:(LFTopBar *)bar { [self goBack]; }
 - (void)topBarForward:(LFTopBar *)bar { [self goForward]; }
-- (void)topBarReload:(LFTopBar *)bar { [[_current session] reload]; }
+- (void)topBarReload:(LFTopBar *)bar {
+    if (_current == _closedForMemory)
+        [self reopenClosedForMemory];
+    else
+        [[_current session] reload];
+}
 - (void)topBarStop:(LFTopBar *)bar { [[_current session] stop]; }
 - (void)topBar:(LFTopBar *)bar action:(UIBarButtonItem *)item { [self showMenuFrom:item]; }
 
@@ -917,7 +1026,8 @@ static const NSUInteger kLiveBackgroundTabs = 1;
     if ([text rangeOfString:@"://"].location != NSNotFound || [text hasPrefix:@"about:"] || [text hasPrefix:@"data:"])
         return text;
     if ([text rangeOfString:@" "].location == NSNotFound && [text rangeOfString:@"."].location != NSNotFound)
-        return [@"https://" stringByAppendingString:text];
+        // As Firefox did: http, which sites with https send on themselves.
+        return [@"http://" stringByAppendingString:text];
     return [LFSettings searchURLFor:text];
 }
 

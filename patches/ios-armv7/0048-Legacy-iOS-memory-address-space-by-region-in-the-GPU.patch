@@ -1,0 +1,225 @@
+From d1ec10ec6c45716462b40aba887e133af9314d28 Mon Sep 17 00:00:00 2001
+From: LR-Vensuki <260785366+LR-Vensuki@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 11:45:10 +0300
+Subject: [PATCH] Legacy iOS memory: address space by region in the GPU stats,
+ smaller chunk recycling, shader compiler memory released
+
+LF_SWGL_GPU_STATS=1 also logs the address space by kernel tag and the
+regions of 8 MB or more. mozjemalloc keeps at most 16 MiB of recycled
+chunks on legacy iOS (128 MiB elsewhere). The GLES2 path compiles its
+vertex stages as programs need them and releases the shader compiler
+after each program.
+---
+ .../RenderCompositorNative.cpp                | 59 +++++++++++++++++++
+ .../RenderCompositorNative.h                  |  1 +
+ gfx/wr/swgl/src/gl.cc                         |  1 +
+ gfx/wr/swgl/src/gpu_gles2.h                   | 49 +++++++++------
+ memory/build/Constants.h                      |  6 ++
+ 5 files changed, 97 insertions(+), 19 deletions(-)
+
+diff --git a/gfx/webrender_bindings/RenderCompositorNative.cpp b/gfx/webrender_bindings/RenderCompositorNative.cpp
+index a509f1a76f..83b2b63990 100644
+--- a/gfx/webrender_bindings/RenderCompositorNative.cpp
++++ b/gfx/webrender_bindings/RenderCompositorNative.cpp
+@@ -679,6 +679,9 @@ bool RenderCompositorNativeSWGL::MakeCurrent() {
+     SwglGpuDescribe(describe, sizeof(describe));
+     printf_stderr("LegacyFox: SWGL pixel shading on the GPU %s: %s\n",
+                   mGpuAttached ? "on" : "refused", describe);
++    if (getenv("LF_SWGL_GPU_STATS")) {
++      LogAddressSpace();
++    }
+     if (!mGpuAttached) {
+       SwglGpuEAGLDestroy(mGpu);
+       mGpu = nullptr;
+@@ -712,8 +715,64 @@ void RenderCompositorNativeSWGL::DoFlush() {
+         s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], m[0], m[1], m[2], m[3],
+         m[4], unsigned(info.resident_size >> 20),
+         unsigned(info.virtual_size >> 20));
++    if (mGpuFrames % 50 == 0) {
++      LogAddressSpace();
++    }
+   }
+ }
++
++// Where the address space goes, by the kernel's tag of each region (malloc,
++// IOKit, IOSurface...), largest first: a 32-bit process runs out of address
++// space long before it runs out of memory.
++void RenderCompositorNativeSWGL::LogAddressSpace() {
++  struct Tag {
++    unsigned tag;
++    uint64_t mapped, resident;
++  };
++  std::vector<Tag> tags;
++  nsCString large;
++  vm_address_t address = 0;
++  uint64_t total = 0;
++  while (true) {
++    vm_size_t size = 0;
++    natural_t depth = 0;
++    vm_region_submap_info_data_64_t region;
++    mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
++    if (vm_region_recurse_64(mach_task_self(), &address, &size, &depth,
++                             (vm_region_info_64_t)&region,
++                             &count) != KERN_SUCCESS) {
++      break;
++    }
++    auto it = std::find_if(tags.begin(), tags.end(), [&](const Tag& t) {
++      return t.tag == region.user_tag;
++    });
++    if (it == tags.end()) {
++      tags.push_back({region.user_tag, 0, 0});
++      it = tags.end() - 1;
++    }
++    if (size >= (8 << 20)) {
++      large.AppendPrintf(" %x+%uM(t%u r%u)", unsigned(address),
++                         unsigned(size >> 20), region.user_tag,
++                         unsigned((uint64_t(region.pages_resident) *
++                                   vm_page_size) >> 20));
++    }
++    it->mapped += size;
++    it->resident += uint64_t(region.pages_resident) * vm_page_size;
++    total += size;
++    address += size;
++  }
++  std::sort(tags.begin(), tags.end(),
++            [](const Tag& a, const Tag& b) { return a.mapped > b.mapped; });
++  nsCString line;
++  line.AppendPrintf("LegacyFox: address space %u MB by tag:",
++                    unsigned(total >> 20));
++  for (size_t i = 0; i < tags.size() && i < 14; i++) {
++    line.AppendPrintf(" %u=%u/%u", tags[i].tag, unsigned(tags[i].mapped >> 20),
++                      unsigned(tags[i].resident >> 20));
++  }
++  printf_stderr("%s\n", line.get());
++  printf_stderr("LegacyFox: regions of 8 MB or more:%s\n", large.get());
++}
+ #endif
+ 
+ bool RenderCompositorNativeSWGL::InitDefaultFramebuffer(
+diff --git a/gfx/webrender_bindings/RenderCompositorNative.h b/gfx/webrender_bindings/RenderCompositorNative.h
+index 0ac446dfc9..4f91a6afe9 100644
+--- a/gfx/webrender_bindings/RenderCompositorNative.h
++++ b/gfx/webrender_bindings/RenderCompositorNative.h
+@@ -242,6 +242,7 @@ class RenderCompositorNativeSWGL : public RenderCompositorNative {
+ #if defined(MOZ_IOS_LEGACY)
+   // Before the layers go to the screen: the GPU is done drawing into them.
+   void DoFlush() override;
++  void LogAddressSpace();
+   // Pixel shading on the GPU (swgl's gpu_gles2.h), when it is on: the GL
+   // context, whether SWGL took it, and the tile mapped for it.
+   struct SwglGpuEAGL* mGpu = nullptr;
+diff --git a/gfx/wr/swgl/src/gl.cc b/gfx/wr/swgl/src/gl.cc
+index 8f54d74986..71c83610da 100644
+--- a/gfx/wr/swgl/src/gl.cc
++++ b/gfx/wr/swgl/src/gl.cc
+@@ -38,6 +38,7 @@
+ #  include "gpu_shaders.h"
+ #  if SWGL_GPU_ESSL
+ #    include <algorithm>
++#    include <malloc/malloc.h>
+ #    include <string>
+ #    include <unordered_map>
+ #    include <vector>
+diff --git a/gfx/wr/swgl/src/gpu_gles2.h b/gfx/wr/swgl/src/gpu_gles2.h
+index 933a531772..5c3c0d1a67 100644
+--- a/gfx/wr/swgl/src/gpu_gles2.h
++++ b/gfx/wr/swgl/src/gpu_gles2.h
+@@ -76,6 +76,7 @@ const unsigned char* glGetString(GLenum);
+ GLint glGetUniformLocation(GLuint, const char*);
+ void glLinkProgram(GLuint);
+ void glPixelStorei(GLenum, GLint);
++void glReleaseShaderCompiler(void);
+ void glReadPixels(GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void*);
+ void glRenderbufferStorage(GLenum, GLenum, GLsizei, GLsizei);
+ void glScissor(GLint, GLint, GLsizei, GLsizei);
+@@ -330,6 +331,27 @@ static void set_filter(GLuint tex, GLenum filter) {
+   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+ }
+ 
++// The pass-through vertex shader for `slots` texture coordinates, made the
++// first time a program needs it: the compiler's memory is dear.
++static GLuint vertex_stage(GpuBackend* g, int slots) {
++  if (g->vs[slots]) return g->vs[slots];
++  std::string src = "attribute vec4 glsl_pos;\n";
++  char buf[96];
++  for (int i = 0; i < slots; i++) {
++    snprintf(buf, sizeof(buf),
++             "attribute vec4 glsl_a%d;\nvarying vec4 glsl_t%d;\n", i, i);
++    src += buf;
++  }
++  src += "void main() {\n gl_Position = glsl_pos;\n";
++  for (int i = 0; i < slots; i++) {
++    snprintf(buf, sizeof(buf), " glsl_t%d = glsl_a%d;\n", i, i);
++    src += buf;
++  }
++  src += "}\n";
++  g->vs[slots] = compile_shader(GL_VERTEX_SHADER, src.c_str(), "vertex stage");
++  return g->vs[slots];
++}
++
+ static bool init_backend(GpuBackend* g) {
+   const char* exts = (const char*)glGetString(GL_EXTENSIONS);
+   g->red_ok = has_extension(exts, "GL_EXT_texture_rg");
+@@ -340,23 +362,7 @@ static bool init_backend(GpuBackend* g) {
+   glGetIntegerv(GL_MAX_TEXTURE_SIZE, &max);
+   if (max > 0) g->max_texture = max;
+ 
+-  for (int slots = 1; slots <= 8; slots++) {
+-    std::string src = "attribute vec4 glsl_pos;\n";
+-    char buf[96];
+-    for (int i = 0; i < slots; i++) {
+-      snprintf(buf, sizeof(buf),
+-               "attribute vec4 glsl_a%d;\nvarying vec4 glsl_t%d;\n", i, i);
+-      src += buf;
+-    }
+-    src += "void main() {\n gl_Position = glsl_pos;\n";
+-    for (int i = 0; i < slots; i++) {
+-      snprintf(buf, sizeof(buf), " glsl_t%d = glsl_a%d;\n", i, i);
+-      src += buf;
+-    }
+-    src += "}\n";
+-    g->vs[slots] = compile_shader(GL_VERTEX_SHADER, src.c_str(), "vertex stage");
+-    if (!g->vs[slots]) return false;
+-  }
++  if (!vertex_stage(g, 1)) return false;
+   // Pixels the CPU shaded, placed by the GPU: texture coordinate (u w, v w,
+   // 0, w), divided here so that perspective quads line up.
+   GLuint copy_fs = compile_shader(
+@@ -798,10 +804,15 @@ static GpuProgram* program_for(GpuBackend* g, const GpuProgramInfo* info) {
+   GpuProgram p;
+   GLuint fs = compile_shader(GL_FRAGMENT_SHADER, (const char*)info->ps,
+                              info->name);
+-  if (fs) {
+-    p.prog = link_program(g->vs[info->slots], fs, info->slots, info->name);
++  GLuint vs = vertex_stage(g, info->slots);
++  if (fs && vs) {
++    p.prog = link_program(vs, fs, info->slots, info->name);
+     glDeleteShader(fs);
+   }
++  // The compiler's working memory goes back: on a 32-bit device the address
++  // space it leaves reserved in malloc's regions is what runs out first.
++  glReleaseShaderCompiler();
++  malloc_zone_pressure_relief(nullptr, 0);
+   if (!p.prog) {
+     g->refused[info] = true;
+     return nullptr;
+diff --git a/memory/build/Constants.h b/memory/build/Constants.h
+index 9f79d8ac05..ec69a2a6a6 100644
+--- a/memory/build/Constants.h
++++ b/memory/build/Constants.h
+@@ -121,6 +121,12 @@ constexpr size_t kCacheLineMask = kCacheLineSize - 1;
+ 
+ // Recycle at most 128 MiB of chunks. This means we retain at most
+ // 6.25% of the process address space on a 32-bit OS for later use.
++#if defined(MOZ_IOS_LEGACY)
++// A 32-bit iOS process has under 1 GiB of address space left once the
++// shared cache and the binary are mapped; recycled chunks hold on to it.
++static constexpr size_t gRecycleLimit = 16_MiB;
++#else
+ static constexpr size_t gRecycleLimit = 128_MiB;
++#endif
+ 
+ #endif /* ! CONSTANTS_H */
+-- 
+2.53.0
+

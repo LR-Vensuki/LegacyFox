@@ -1,0 +1,83 @@
+From cca21f73dc924374c54fa1a42cd4ea36fbd06f92 Mon Sep 17 00:00:00 2001
+From: LR-Vensuki <260785366+LR-Vensuki@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 21:43:29 +0300
+Subject: [PATCH] Legacy iOS address space: smaller JIT reservation and canvas
+ thread stack, low memory reaches the app
+
+The JIT reserves 24 MB instead of 32 (heavy news sites use 6-10 MB, and
+GCs discard code when it runs short); the canvas render thread gets 512 KB
+instead of the 4 MB ANGLE needs elsewhere. Each time the watcher signals
+low memory it also posts LegacyFoxMemoryLow, for the embedding app to
+drop pages kept in the background.
+---
+ gfx/ipc/CanvasRenderThread.cpp       |  5 +++++
+ js/src/jit/ProcessExecutableMemory.h |  5 +++--
+ widget/uikit/nsAppShell.mm           | 11 +++++++++--
+ 3 files changed, 17 insertions(+), 4 deletions(-)
+
+diff --git a/gfx/ipc/CanvasRenderThread.cpp b/gfx/ipc/CanvasRenderThread.cpp
+index 89798bfc54..b3e7cbba1a 100644
+--- a/gfx/ipc/CanvasRenderThread.cpp
++++ b/gfx/ipc/CanvasRenderThread.cpp
+@@ -74,8 +74,13 @@ void CanvasRenderThread::Start() {
+   // Intel Vulkan driver initialization in bug 1716120.
+   //
+   // Note: we only override it if it's limited already.
++#ifdef MOZ_IOS_LEGACY
++  // No ANGLE or GPU canvas there, and every MB of address space counts.
++  const uint32_t stackSize = 512 << 10;
++#else
+   const uint32_t stackSize =
+       nsIThreadManager::DEFAULT_STACK_SIZE ? 4096 << 10 : 0;
++#endif
+ 
+   nsresult rv = NS_NewNamedThread(
+       "CanvasRenderer", getter_AddRefs(thread),
+diff --git a/js/src/jit/ProcessExecutableMemory.h b/js/src/jit/ProcessExecutableMemory.h
+index 4097f2339a..7fb7c33ca8 100644
+--- a/js/src/jit/ProcessExecutableMemory.h
++++ b/js/src/jit/ProcessExecutableMemory.h
+@@ -20,8 +20,9 @@ namespace jit {
+ // attacks.
+ #if defined(MOZ_IOS_LEGACY)
+ // 32-bit iOS apps get about 750 MB of address space, and XUL alone maps
+-// 120 MB of it; the reservation is all of this, used or not.
+-static const size_t MaxCodeBytesPerProcess = 32 * 1024 * 1024;
++// 120 MB of it; the reservation is all of this, used or not. Heavy news
++// sites use 6-10 MB, and GCs discard code when it runs short.
++static const size_t MaxCodeBytesPerProcess = 24 * 1024 * 1024;
+ #elif JS_BITS_PER_WORD == 32
+ static const size_t MaxCodeBytesPerProcess = 140 * 1024 * 1024;
+ #else
+diff --git a/widget/uikit/nsAppShell.mm b/widget/uikit/nsAppShell.mm
+index 656e8a7c3a..89f9457c31 100644
+--- a/widget/uikit/nsAppShell.mm
++++ b/widget/uikit/nsAppShell.mm
+@@ -61,8 +61,9 @@ void SetLegacyAppInBackground(bool aBackground);
+ // gets small, or the memory iOS has left for all apps does (it kills the
+ // app in front without a warning when that runs out), Gecko is told memory
+ // is low (caches, JIT code and empty GC chunks go back), and that it is fine
+-// again once there is room. With almost nothing left the embedding app is
+-// told (LegacyFoxMemoryCritical): it can drop the page before iOS kills it.
++// again once there is room. The embedding app is told too
++// (LegacyFoxMemoryLow), and with almost nothing left
++// (LegacyFoxMemoryCritical): it can drop the page before iOS kills it.
+ static void WatchAddressSpace() {
+   static dispatch_source_t timer = dispatch_source_create(
+       DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
+@@ -124,6 +125,12 @@ static void WatchAddressSpace() {
+       low = true;
+       lowSince = now;
+       NS_NotifyOfMemoryPressure(MemoryPressureState::LowMemory);
++      // The embedding app can drop pages kept in the background.
++      dispatch_async(dispatch_get_main_queue(), ^{
++        [[NSNotificationCenter defaultCenter]
++            postNotificationName:@"LegacyFoxMemoryLow"
++                          object:nil];
++      });
+     } else if (low && roomy) {
+       fprintf(stderr, "LegacyFox: memory fine again: %u MB free, level %d%%\n",
+               unsigned(free >> 20), level);
+-- 
+2.53.0
+
