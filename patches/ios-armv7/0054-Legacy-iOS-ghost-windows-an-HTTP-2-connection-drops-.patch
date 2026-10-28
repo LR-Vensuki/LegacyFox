@@ -1,0 +1,36 @@
+From f59f9e08a327938c7338fcde2cd0ca6365ed6bc6 Mon Sep 17 00:00:00 2001
+From: LR-Vensuki <260785366+LR-Vensuki@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 02:40:28 +0300
+Subject: [PATCH] Legacy iOS ghost windows: an HTTP/2 connection drops the
+ first channel's callbacks
+
+In a single process they are the page's ScriptLoadHandler (or XHR...), which
+kept the ScriptLoader, its document and window alive as long as the pooled
+connection to a counter host (mc.yandex.ru, top.mail.ru) stayed open.
+---
+ netwerk/protocol/http/nsHttpConnection.cpp | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/netwerk/protocol/http/nsHttpConnection.cpp b/netwerk/protocol/http/nsHttpConnection.cpp
+index 0bb41bff52..d4e8cd89c0 100644
+--- a/netwerk/protocol/http/nsHttpConnection.cpp
++++ b/netwerk/protocol/http/nsHttpConnection.cpp
+@@ -415,6 +415,15 @@ void nsHttpConnection::StartSpdy(nsITLSSocketControl* sslControl,
+ 
+   mTransaction = mSpdySession;
+ 
++  // In a single process the callbacks are those of the first channel's
++  // listener (a page's ScriptLoadHandler, XHR...). The handshake is done and
++  // client certificates are denied above, so drop them: an HTTP/2 connection
++  // outlives the page and would keep its window alive.
++  {
++    MutexAutoLock lock(mCallbacksLock);
++    mCallbacks = nullptr;
++  }
++
+   if (mDontReuse) {
+     mSpdySession->DontReuse();
+   }
+-- 
+2.53.0
+

@@ -15,6 +15,7 @@
 #include <sys/time.h>
 #include <mach-o/dyld.h>
 #include <mach/mach.h>
+#include <malloc/malloc.h>
 
 static void where(const char *what, uintptr_t addr) {
     Dl_info info;
@@ -155,6 +156,11 @@ static void handler(int sig, siginfo_t *si, void *ctx) {
     raise(sig);
 }
 
+// Zones made by malloc_create_zone (traced below; LegacyFox's own rebinding
+// replaces the tracing in the app, so this stays empty there).
+static malloc_zone_t *created_zones[32];
+static unsigned ncreated;
+
 // SIGWINCH (kill -WINCH <pid>): the address space by VM tag, and every
 // region of 4 MB or more, for out-of-memory hunts.
 static void vmmap(int sig) {
@@ -194,6 +200,25 @@ static void vmmap(int sig) {
             fprintf(stderr, "  tag %3d: %6lu KB virtual, %6lu KB resident\n", t,
                     (unsigned long)(by_tag[t] >> 10), (unsigned long)(resident_by_tag[t] >> 10));
     fprintf(stderr, "  total: %lu MB\n", (unsigned long)(total >> 20));
+    // Every malloc zone: who keeps regions that are mostly empty.
+    vm_address_t *zones = NULL;
+    unsigned nzones = 0;
+    if (malloc_get_all_zones(mach_task_self(), NULL, &zones, &nzones) == KERN_SUCCESS)
+        for (unsigned i = 0; i < nzones; i++) {
+            malloc_zone_t *zone = (malloc_zone_t *)zones[i];
+            malloc_statistics_t st = { 0 };
+            malloc_zone_statistics(zone, &st);
+            fprintf(stderr, "  zone %p %s: %u blocks, %lu KB in use, %lu KB allocated\n", zone,
+                    malloc_get_zone_name(zone) ?: "?", st.blocks_in_use,
+                    (unsigned long)(st.size_in_use >> 10), (unsigned long)(st.size_allocated >> 10));
+        }
+    for (unsigned i = 0; i < ncreated; i++)
+        if (created_zones[i]) {
+            malloc_statistics_t st = { 0 };
+            malloc_zone_statistics(created_zones[i], &st);
+            fprintf(stderr, "  created zone %p: %u blocks, %lu KB in use, %lu KB allocated\n", created_zones[i],
+                    st.blocks_in_use, (unsigned long)(st.size_in_use >> 10), (unsigned long)(st.size_allocated >> 10));
+        }
 }
 
 // LF_TRACE_MMAP: who maps 4 MB or more at once, with the caller's frames.
@@ -226,6 +251,26 @@ static void *traced_mmap(void *addr, size_t len, int prot, int flags, int fd, of
         }
     }
     return p;
+}
+
+// ...and malloc_create_zone, to see who makes its own malloc zones.
+static malloc_zone_t *(*real_create_zone)(vm_size_t, unsigned);
+static malloc_zone_t *traced_create_zone(vm_size_t start, unsigned flags) {
+    malloc_zone_t *zone = real_create_zone(start, flags);
+    fprintf(stderr, "\n*** crashlog: malloc_create_zone -> %p\n", zone);
+    where("ret", (uintptr_t)__builtin_return_address(0));
+    if (ncreated < 32)
+        created_zones[ncreated++] = zone;
+    return zone;
+}
+static void (*real_destroy_zone)(malloc_zone_t *);
+static void traced_destroy_zone(malloc_zone_t *zone) {
+    fprintf(stderr, "\n*** crashlog: malloc_destroy_zone %p\n", zone);
+    where("ret", (uintptr_t)__builtin_return_address(0));
+    for (unsigned i = 0; i < ncreated; i++)
+        if (created_zones[i] == zone)
+            created_zones[i] = NULL;
+    real_destroy_zone(zone);
 }
 
 static int rebound;
@@ -265,9 +310,14 @@ static void rebind_mmap(const struct mach_header *mh, intptr_t slide) {
                 if (sym == INDIRECT_SYMBOL_ABS || sym == INDIRECT_SYMBOL_LOCAL ||
                     sym == (INDIRECT_SYMBOL_LOCAL | INDIRECT_SYMBOL_ABS))
                     continue;
-                if (!strcmp(strs + syms[sym].n_un.n_strx, "_mmap")) {
+                const char *name = strs + syms[sym].n_un.n_strx;
+                if (!strcmp(name, "_mmap")) {
                     ptrs[k] = (void *)traced_mmap;
                     rebound++;
+                } else if (!strcmp(name, "_malloc_create_zone")) {
+                    ptrs[k] = (void *)traced_create_zone;
+                } else if (!strcmp(name, "_malloc_destroy_zone")) {
+                    ptrs[k] = (void *)traced_destroy_zone;
                 }
             }
         }
@@ -295,6 +345,8 @@ __attribute__((constructor)) static void install(void) {
     sigaction(SIGUSR2, &su, NULL);
     signal(SIGWINCH, vmmap);
     real_mmap = dlsym(RTLD_DEFAULT, "mmap");
+    real_create_zone = dlsym(RTLD_DEFAULT, "malloc_create_zone");
+    real_destroy_zone = dlsym(RTLD_DEFAULT, "malloc_destroy_zone");
     _dyld_register_func_for_add_image(rebind_mmap);
     if (getenv("LF_TRACE_MMAP"))
         fprintf(stderr, "crashlog: mmap rebound in %d places\n", rebound);

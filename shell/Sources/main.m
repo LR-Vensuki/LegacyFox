@@ -1,5 +1,6 @@
 #import "LFAppDelegate.h"
 #import "LFSettings.h"
+#import "LFAddressSpace.h"
 #import "Gecko/LFGecko.h"
 #include <dlfcn.h>
 #include <stdio.h>
@@ -38,6 +39,8 @@ static void LFDebugSetup(void) {
 int main(int argc, char *argv[]) {
     NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
     LFDebugSetup();
+    // After crashlog: its tracing of malloc_create_zone is replaced.
+    LFAddressSpaceInstall();
     [LFSettings applyGpuRendering];
     // Rust threads (WebRender's eight, Glean's) get 1 MB stacks instead of
     // 2 MB: address space is what a 32-bit browser runs out of.

@@ -9,7 +9,7 @@ set -e
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 DEVICE=${DEVICE:-legacyfox-device}
 DEST=/var/mobile/Library/LegacyFox
-pgrep -f "iproxy 2222" >/dev/null || (setsid nohup iproxy 2222 22 >/dev/null 2>&1 &)
+pgrep -f "iproxy.* 2222 22" >/dev/null || (setsid nohup iproxy -u b99cc18a425680e683f7cec0d86658b7e9b75ab8 2222 22 >/dev/null 2>&1 &)
 [ -n "$NO_ENGINE" ] || "$ROOT/tools/mach.sh" build -j8 >/tmp/legacyfox-build.log 2>&1 || { grep " E " /tmp/legacyfox-build.log | head -20; exit 1; }
 make -C "$ROOT" app
 cp "$ROOT/prefs/legacyfox-dev.js" "$ROOT/shell/build/LegacyFox.app/Frameworks/defaults/pref/"

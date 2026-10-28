@@ -86,6 +86,9 @@ pref("javascript.options.main_process_disable_jit", false);
 pref("javascript.options.baselinejit", true);
 pref("javascript.options.ion", true);
 pref("javascript.options.ion.threshold", 3000);
+// No bytecode cache: encoding a big bundle (bsky.app) grows buffers of 33-66 MB
+// two at a time, on the main thread, right when the page needs the room.
+pref("dom.script_loader.bytecode_cache.enabled", false);
 
 // ---- Video: H.264 for the hardware decoder ---------------------------------
 pref("media.av1.enabled", false);

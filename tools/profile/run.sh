@@ -6,7 +6,9 @@
 #   tools/profile/run.sh -s OUT.log      # only the summary of a log
 # Optional: SAMPLE_FROM=s SAMPLES=n [SAMPLE_SIG=USR2] take n thread samples
 # SAMPLE_GAP (0.5) s apart from s seconds on (tools/profile/threads.py reads them);
-# WINCH_AT=s logs the address space map at s seconds.
+# WINCH_AT=s logs the address space map at s seconds; LFVM_AT='s1 s2 ...'
+# appends tools/lfvm maps taken at those seconds (regions of LFVM_MIN KB, 1024,
+# and more).
 set -e
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 DEVICE=${DEVICE:-legacyfox-device}
@@ -18,11 +20,15 @@ else
     DEBUG=$(printf '%s\n' "$@")
     PROBES=""
     [ -n "$WINCH_AT" ] && PROBES="(sleep $WINCH_AT; killall -WINCH LegacyFox) &"
+    for t in $LFVM_AT; do
+        PROBES="$PROBES (sleep $t; p=\$(launchctl list | grep -i legacyfox | sed 's/[^0-9].*//'); echo \"== lfvm at $t s\"; /var/mobile/legacyfox-test/lfvm \$p ${LFVM_MIN:-1024}) >> /var/mobile/legacyfox-test/lfvm.out &"
+    done
     [ -n "$SAMPLES" ] && PROBES="$PROBES (sleep ${SAMPLE_FROM:-30}; i=0; while [ \$i -lt $SAMPLES ]; do killall -${SAMPLE_SIG:-USR2} LegacyFox; sleep ${SAMPLE_GAP:-0.5}; i=\$((i+1)); done) &"
     ssh "$DEVICE" "mkdir -p /var/mobile/legacyfox-test"
     scp -O -q "$ROOT/tools/crashlog/crashlog.dylib" "$DEVICE:/var/mobile/legacyfox-test/"
     # UI steps change the saved tabs: they come back after the run.
     ssh "$DEVICE" "killall LegacyFox 2>/dev/null; sleep 1
+rm -f /var/mobile/legacyfox-test/lfvm.out
 cp -p $DEST/session.plist $DEST/session.plist.run 2>/dev/null
 printf '%s\n' '$DEBUG' > $DEST/debug; chown mobile $DEST/debug; rm -f $DEST/lf.log
 uiopen legacyfox:// ; $PROBES sleep $SECONDS_
@@ -30,6 +36,7 @@ if killall -0 LegacyFox 2>/dev/null; then echo 'LegacyFox: still running at the 
 killall LegacyFox 2>/dev/null; sleep 1
 [ -f $DEST/session.plist.run ] && mv $DEST/session.plist.run $DEST/session.plist; true" > "$OUT.end"
     scp -O -q "$DEVICE:$DEST/lf.log" "$OUT"
+    [ -n "$LFVM_AT" ] && scp -O -q "$DEVICE:/var/mobile/legacyfox-test/lfvm.out" "$OUT.vm"
     cat "$OUT.end" >> "$OUT"; rm -f "$OUT.end"
 fi
 echo "== $OUT: $(wc -l < "$OUT") lines"
@@ -39,5 +46,6 @@ grep -a -E 'process [0-9]+ MB resident' "$OUT" | sed -E 's/.* process ([0-9]+) M
 grep -a -E 'address space [0-9]+ MB by tag' "$OUT" | tail -n 1 | cut -c1-240 || true
 grep -a -cE 'gpu: CPU (draw|for)' "$OUT" | sed 's/^/CPU fallbacks: /' || true
 grep -a -nE "can't allocate|Assertion failure|MOZ_CRASH|Hit MOZ_|crashlog: signal|EXC_|Terminated|running at the end|applicationWillResignActive|applicationDidEnterBackground" "$OUT" | cut -c1-200 | head -20 || true
+[ -f "$OUT.vm" ] && grep -a -E '^(== lfvm|total)' "$OUT.vm" | cut -c1-120
 # Main-thread stalls: gaps of 1.5 s or more between scroll steps.
 grep -a 'GeckoView.Module.*ScrollBy' "$OUT" | cut -f1 | awk 'NR==1{f=$1} {if (NR>1 && $1-p>=1500) printf "stall %.1f s at %.1f s\n", ($1-p)/1000, (p-f)/1000; p=$1; n++} END {if (n) printf "scroll steps %d over %.0f s\n", n, (p-f)/1000}' || true
